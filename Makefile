@@ -12,15 +12,14 @@ build:
 test:
 	go test -race ./...
 
-# Generate protobuf code
+# Generate protobuf and gRPC Go code into internal/pb
 proto:
-	@if [ -d "proto" ] && command -v buf >/dev/null 2>&1; then \
-		cd proto && buf generate && echo "Proto generated with buf"; \
-	elif [ -d "proto" ] && command -v protoc >/dev/null 2>&1; then \
-		protoc --go_out=. --go-grpc_out=. proto/*.proto && echo "Proto generated with protoc"; \
-	else \
-		echo "Skipping proto generation: buf/protoc tool or proto directory not found"; \
-	fi
+	@mkdir -p internal/pb
+	protoc --proto_path=proto \
+		--go_out=internal/pb --go_opt=paths=source_relative \
+		--go-grpc_out=internal/pb --go-grpc_opt=paths=source_relative \
+		proto/pubsub.proto
+	@echo "✓ Proto generated into internal/pb"
 
 # Lint code using go vet and static analysis tools if present
 lint:
@@ -34,5 +33,5 @@ run-broker:
 
 # Clean binaries and caches
 clean:
-	rm -rf bin/ proto/pubsubv1/
+	rm -rf bin/ internal/pb/ proto/gen/ proto/pubsubv1/
 	go clean -cache

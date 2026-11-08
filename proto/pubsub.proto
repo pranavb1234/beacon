@@ -2,104 +2,17 @@ syntax = "proto3";
 
 package pubsub.v1;
 
-option go_package = "github.com/pranavb1234/beacon/proto/pubsubv1";
+option go_package = "github.com/pranavb1234/beacon/internal/pb;pb";
 
-// ─── Client-facing messages ───────────────────────────────────────────────────
-
-message PublishRequest {
-  string topic        = 1; // topic name (UTF-8, max 255 chars)
-  bytes  payload      = 2; // opaque message body
-  string publisher_id = 3; // idempotency hint; not unique-enforced in Phase 0
+// PingService provides a minimal health/ping RPC placeholder.
+service PingService {
+  rpc Ping(PingRequest) returns (PingResponse);
 }
 
-message PublishResponse {
-  uint64 seq_num  = 1; // monotonically increasing sequence number for this topic
-  bool   accepted = 2;
+message PingRequest {
+  string message = 1;
 }
 
-message SubscribeRequest {
-  string topic         = 1;
-  string group_id      = 2; // empty = no group, every subscriber gets every message
-  string subscriber_id = 3;
-  uint64 start_seq     = 4; // 0 = receive new messages only; >0 = replay from ring buffer
-}
-
-message SubscribeEvent {
-  string topic        = 1;
-  uint64 seq_num      = 2;
-  bytes  payload      = 3;
-  string publisher_id = 4;
-}
-
-message AckRequest {
-  string topic         = 1;
-  uint64 seq_num       = 2;
-  string subscriber_id = 3;
-}
-
-message AckResponse {
-  bool ok = 1;
-}
-
-// ─── Internal cluster messages ────────────────────────────────────────────────
-
-message ForwardPublishRequest {
-  string topic        = 1;
-  bytes  payload      = 2;
-  string publisher_id = 3;
-  string source_node  = 4; // the node that received the original client Publish RPC
-}
-
-message ForwardPublishResponse {
-  uint64 seq_num  = 1;
-  bool   accepted = 2;
-}
-
-message JoinClusterRequest {
-  string node_id = 1;
-  string addr    = 2; // advertised gRPC address (host:port)
-}
-
-message JoinClusterResponse {
-  bool            ok    = 1;
-  repeated string peers = 2; // current cluster membership snapshot
-}
-
-message HeartbeatRequest {
-  string node_id = 1;
-  uint64 epoch   = 2; // monotonically increasing term; prevents stale-leader accepts
-}
-
-message HeartbeatResponse {
-  uint64 epoch = 1;
-  bool   alive = 2;
-}
-
-// ─── Services ─────────────────────────────────────────────────────────────────
-
-// PubSubService is the client-facing API exposed on every broker node.
-// Clients may connect to any node; the node forwards to the topic owner if needed.
-service PubSubService {
-  // Publish sends a message to a topic; routes to the owner node transparently.
-  rpc Publish(PublishRequest) returns (PublishResponse);
-
-  // Subscribe opens a server-streaming channel for real-time delivery.
-  // The stream stays open until the client cancels or the server disconnects.
-  rpc Subscribe(SubscribeRequest) returns (stream SubscribeEvent);
-
-  // Ack acknowledges delivery; lets the broker cancel its retry timer.
-  rpc Ack(AckRequest) returns (AckResponse);
-}
-
-// BrokerInternalService is the inter-node RPC surface. Never exposed to clients.
-service BrokerInternalService {
-  // ForwardPublish routes a publish from a non-owner node to the topic owner.
-  rpc ForwardPublish(ForwardPublishRequest) returns (ForwardPublishResponse);
-
-  // JoinCluster is called by a new node to announce itself and receive peers.
-  rpc JoinCluster(JoinClusterRequest) returns (JoinClusterResponse);
-
-  // Heartbeat is sent periodically for failure detection.
-  // A missing heartbeat beyond HeartbeatTimeout triggers replica promotion.
-  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+message PingResponse {
+  string message = 1;
 }

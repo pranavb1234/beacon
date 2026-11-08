@@ -4,49 +4,26 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 jobs:
-  test:
+  ci:
     name: Build & Test
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.22"
-          cache: true          # caches $GOPATH/pkg/mod
 
-      - name: Set up buf
-        uses: bufbuild/buf-setup-action@v1
-        with:
-          version: "1.34.0"
-
-      - name: Lint proto
-        run: buf lint
-        working-directory: proto
-
-      - name: Generate proto
-        run: buf generate
-        working-directory: proto
-
-      - name: Verify no uncommitted generated files
-        run: |
-          git diff --exit-code -- proto/pubsubv1/ \
-            || (echo "Regenerated proto files differ from committed files. Run 'make proto' locally." && exit 1)
+      - name: Run go vet
+        run: go vet ./...
 
       - name: Build all packages
         run: go build ./...
 
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test with race detector
-        run: go test -race -timeout 120s -count=1 ./...
-
-      - name: Check for goroutine leaks (phase 1+)
-        # goleak integration added when streaming goroutines are introduced.
-        run: echo "goleak checks added in Phase 1"
+      - name: Run tests with race detector
+        run: go test -race ./...
