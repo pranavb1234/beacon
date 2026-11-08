@@ -1,5 +1,5 @@
 // Package broker implements the core topic management, message sequencing,
-// and fan-out engine for a single broker node.
+// fan-out, and configurable backpressure engine for a single broker node.
 //
 // Thread Safety & Lock Hierarchy:
 // To prevent deadlocks, locks must strictly be acquired in the following order:
@@ -36,6 +36,8 @@ var (
 	ErrSubscriberNotFound = errors.New("broker: subscriber not found")
 	// ErrNilSubscriber is returned when adding a nil subscriber.
 	ErrNilSubscriber = errors.New("broker: subscriber cannot be nil")
+	// ErrBufferFull is set when a subscriber is disconnected due to a full buffer under PolicyDisconnect.
+	ErrBufferFull = errors.New("broker: subscriber buffer full; disconnected")
 )
 
 // Message represents an event published to a topic.
@@ -46,6 +48,112 @@ type Message struct {
 	TimestampNS int64  `json:"timestamp_ns"`
 }
 
+// DeliveryResult describes the outcome of an attempted message delivery to a subscriber.
+type DeliveryResult int
+
+const (
+	// DeliverySuccess indicates the message was enqueued into the subscriber buffer.
+	DeliverySuccess DeliveryResult = iota
+	// DeliveryDropped indicates a message was dropped (either evicted or rejected due to timeout).
+	DeliveryDropped
+	// DeliveryDisconnected indicates the subscriber was disconnected due to buffer exhaustion.
+	DeliveryDisconnected
+)
+
+// BackpressurePolicyHandler defines the interface for handling full subscriber channels.
+type BackpressurePolicyHandler interface {
+	Deliver(sub *Subscriber, msg *Message, timeout time.Duration) DeliveryResult
+}
+
+// BackpressureFunc is a functional adapter that implements BackpressurePolicyHandler.
+type BackpressureFunc func(sub *Subscriber, msg *Message, timeout time.Duration) DeliveryResult
+
+// Deliver implements BackpressurePolicyHandler.
+func (f BackpressureFunc) Deliver(sub *Subscriber, msg *Message, timeout time.Duration) DeliveryResult {
+	return f(sub, msg, timeout)
+}
+
+// BlockDelivery waits with a timeout until the subscriber channel has room.
+func BlockDelivery(sub *Subscriber, msg *Message, timeout time.Duration) DeliveryResult {
+	// Fast path: try immediate send
+	select {
+	case sub.Send <- msg:
+		return DeliverySuccess
+	default:
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-sub.Ctx.Done():
+		return DeliveryDisconnected
+	case sub.Send <- msg:
+		return DeliverySuccess
+	case <-timer.C:
+		// Publisher timed out waiting for subscriber to drain buffer
+		return DeliveryDropped
+	}
+}
+
+// DropOldestDelivery evicts the oldest queued message in the subscriber buffer and enqueues the new one.
+func DropOldestDelivery(sub *Subscriber, msg *Message, _ time.Duration) DeliveryResult {
+	// Fast path: try immediate send
+	select {
+	case sub.Send <- msg:
+		return DeliverySuccess
+	default:
+	}
+
+	// Buffer is full: drain oldest message if possible
+	select {
+	case <-sub.Send:
+	default:
+	}
+
+	// Enqueue the new message
+	select {
+	case sub.Send <- msg:
+		return DeliveryDropped // older message dropped to enqueue new one
+	default:
+		// Fallback if another push raced
+		return DeliveryDropped
+	}
+}
+
+// DisconnectDelivery forcibly closes the subscriber if its channel is full.
+func DisconnectDelivery(sub *Subscriber, msg *Message, _ time.Duration) DeliveryResult {
+	select {
+	case sub.Send <- msg:
+		return DeliverySuccess
+	default:
+		sub.setErr(ErrBufferFull)
+		return DeliveryDisconnected
+	}
+}
+
+// PolicyHandler maps a config policy to its corresponding delivery handler.
+func PolicyHandler(policy config.BackpressurePolicy) BackpressurePolicyHandler {
+	switch config.NormalizePolicy(string(policy)) {
+	case config.PolicyDropOldest:
+		return BackpressureFunc(DropOldestDelivery)
+	case config.PolicyDisconnect:
+		return BackpressureFunc(DisconnectDelivery)
+	case config.PolicyBlock:
+		fallthrough
+	default:
+		return BackpressureFunc(BlockDelivery)
+	}
+}
+
+// Stats holds operational telemetry counters for the broker.
+type Stats struct {
+	Published    uint64 `json:"published"`
+	Delivered    uint64 `json:"delivered"`
+	Dropped      uint64 `json:"dropped"`
+	Disconnected uint64 `json:"disconnected"`
+}
+
 // Subscriber represents an active subscriber to a topic.
 type Subscriber struct {
 	ID     string
@@ -53,6 +161,9 @@ type Subscriber struct {
 	Done   chan struct{}
 	Ctx    context.Context
 	Cancel context.CancelFunc
+
+	err   error
+	errMu sync.RWMutex
 
 	mu     sync.Mutex
 	closed bool
@@ -74,76 +185,57 @@ func NewSubscriber(id string, bufferSize int) *Subscriber {
 	}
 }
 
-// Deliver attempts to send a message to the subscriber using the configured backpressure policy.
+// Err returns the error that caused subscriber termination, if any.
+func (s *Subscriber) Err() error {
+	s.errMu.RLock()
+	defer s.errMu.RUnlock()
+	return s.err
+}
+
+func (s *Subscriber) setErr(err error) {
+	s.errMu.Lock()
+	if s.err == nil {
+		s.err = err
+	}
+	s.errMu.Unlock()
+}
+
+// Deliver attempts to deliver a message using the given backpressure handler.
 // It acquires Subscriber.mu to guarantee that a send is never attempted on a closed channel.
-func (s *Subscriber) Deliver(msg *Message, policy config.BackpressurePolicy) bool {
+func (s *Subscriber) Deliver(msg *Message, handler BackpressurePolicyHandler, timeout time.Duration) DeliveryResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.closed {
-		return false
+		return DeliveryDisconnected
 	}
 
-	switch policy {
-	case config.PolicyBlock:
-		select {
-		case <-s.Ctx.Done():
-			return false
-		case s.Send <- msg:
-			return true
-		}
-
-	case config.PolicyDropOldest:
-		select {
-		case s.Send <- msg:
-			return true
-		default:
-			// Buffer is full: evict oldest message to make room
-			select {
-			case <-s.Send:
-			default:
-			}
-			// Attempt to insert new message
-			select {
-			case s.Send <- msg:
-				return true
-			default:
-				return false
-			}
-		}
-
-	case config.PolicyDisconnect:
-		select {
-		case s.Send <- msg:
-			return true
-		default:
-			// Slow consumer cannot keep up; signal disconnect
+	result := handler.Deliver(s, msg, timeout)
+	if result == DeliveryDisconnected {
+		// Cleanly close subscriber channel immediately on disconnect
+		if s.Cancel != nil {
 			s.Cancel()
-			return false
 		}
-
-	default:
-		select {
-		case s.Send <- msg:
-			return true
-		default:
-			return false
-		}
+		s.closed = true
+		close(s.Done)
+		close(s.Send)
 	}
+	return result
 }
 
 // Close closes the subscriber's channels exactly once and cancels its context.
 // Safe to call multiple times and from multiple concurrent goroutines.
 func (s *Subscriber) Close() {
 	s.once.Do(func() {
-		// Cancel context first to abort any blocked operations
 		if s.Cancel != nil {
 			s.Cancel()
 		}
 		s.mu.Lock()
-		s.closed = true
-		close(s.Done)
-		close(s.Send)
+		if !s.closed {
+			s.closed = true
+			close(s.Done)
+			close(s.Send)
+		}
 		s.mu.Unlock()
 	})
 }
@@ -175,12 +267,18 @@ func (t *Topic) SubscribersCount() int {
 	return len(t.subscribers)
 }
 
-// Manager coordinates topics, publishers, and subscribers on a broker node.
+// Manager coordinates topics, publishers, subscribers, and backpressure on a broker node.
 type Manager struct {
 	mu     sync.RWMutex
 	topics map[string]*Topic
 	cfg    *config.Config
 	met    *metrics.Metrics
+
+	// Telemetry counters
+	publishedCount    uint64
+	deliveredCount    uint64
+	droppedCount      uint64
+	disconnectedCount uint64
 }
 
 // Broker is an alias for Manager for compatibility.
@@ -203,9 +301,18 @@ func New(cfg *config.Config, met *metrics.Metrics) *Broker {
 	return NewManager(cfg, met)
 }
 
+// Stats returns a snapshot of current broker counters.
+func (m *Manager) Stats() Stats {
+	return Stats{
+		Published:    atomic.LoadUint64(&m.publishedCount),
+		Delivered:    atomic.LoadUint64(&m.deliveredCount),
+		Dropped:      atomic.LoadUint64(&m.droppedCount),
+		Disconnected: atomic.LoadUint64(&m.disconnectedCount),
+	}
+}
+
 // GetOrCreateTopic returns the *Topic for the given name, creating it if it does not yet exist.
 func (m *Manager) GetOrCreateTopic(name string) *Topic {
-	// Fast path: acquire read lock
 	m.mu.RLock()
 	if t, exists := m.topics[name]; exists {
 		m.mu.RUnlock()
@@ -213,11 +320,9 @@ func (m *Manager) GetOrCreateTopic(name string) *Topic {
 	}
 	m.mu.RUnlock()
 
-	// Slow path: acquire write lock to insert topic
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Re-check under write lock
 	if t, exists := m.topics[name]; exists {
 		return t
 	}
@@ -272,7 +377,6 @@ func (m *Manager) RemoveSubscriber(topicName string, subID string) error {
 		return ErrSubscriberNotFound
 	}
 
-	// Close outside of topic lock to minimize lock contention
 	sub.Close()
 	return nil
 }
@@ -281,8 +385,8 @@ func (m *Manager) RemoveSubscriber(topicName string, subID string) error {
 func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
 	t := m.GetOrCreateTopic(topicName)
 
-	// Atomically increment and assign the sequence number
 	seq := atomic.AddUint64(&t.nextSeq, 1)
+	atomic.AddUint64(&m.publishedCount, 1)
 
 	msg := &Message{
 		Topic:       topicName,
@@ -299,10 +403,33 @@ func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
 	}
 	t.mu.RUnlock()
 
-	// Deliver to all subscribers according to backpressure policy
-	policy := m.cfg.BackpressurePolicy
+	handler := PolicyHandler(m.cfg.BackpressurePolicy)
+	timeout := m.cfg.BlockTimeout
+	if timeout <= 0 {
+		timeout = 500 * time.Millisecond
+	}
+
+	var disconnectedIDs []string
 	for _, s := range subs {
-		s.Deliver(msg, policy)
+		result := s.Deliver(msg, handler, timeout)
+		switch result {
+		case DeliverySuccess:
+			atomic.AddUint64(&m.deliveredCount, 1)
+		case DeliveryDropped:
+			atomic.AddUint64(&m.droppedCount, 1)
+		case DeliveryDisconnected:
+			atomic.AddUint64(&m.disconnectedCount, 1)
+			disconnectedIDs = append(disconnectedIDs, s.ID)
+		}
+	}
+
+	// Remove any disconnected subscribers from topic
+	if len(disconnectedIDs) > 0 {
+		t.mu.Lock()
+		for _, id := range disconnectedIDs {
+			delete(t.subscribers, id)
+		}
+		t.mu.Unlock()
 	}
 
 	return seq, nil

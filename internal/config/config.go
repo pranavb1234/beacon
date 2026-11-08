@@ -68,6 +68,9 @@ type Config struct {
 	// BackpressurePolicy specifies the policy when subscriber buffer overflows (block, drop-oldest, disconnect).
 	BackpressurePolicy BackpressurePolicy `yaml:"backpressure_policy"`
 
+	// BlockTimeout is the maximum time a publisher waits in PolicyBlock before abandoning delivery to a full buffer.
+	BlockTimeout time.Duration `yaml:"block_timeout,omitempty"`
+
 	// ReplicationMode specifies whether replication across brokers is sync or async.
 	ReplicationMode ReplicationMode `yaml:"replication_mode"`
 
@@ -93,6 +96,7 @@ type rawYAMLConfig struct {
 	AckTimeout           time.Duration      `yaml:"ack_timeout"`
 	MaxRetries           int                `yaml:"max_retries"`
 	BackpressurePolicy   BackpressurePolicy `yaml:"backpressure_policy"`
+	BlockTimeout         time.Duration      `yaml:"block_timeout"`
 	ReplicationMode      ReplicationMode    `yaml:"replication_mode"`
 	RingVirtualNodes     int                `yaml:"ring_virtual_nodes"`
 	MetricsAddr          string             `yaml:"metrics_addr"`
@@ -111,6 +115,7 @@ func Default() *Config {
 		AckTimeout:           3 * time.Second,
 		MaxRetries:           3,
 		BackpressurePolicy:   PolicyBlock,
+		BlockTimeout:         500 * time.Millisecond,
 		ReplicationMode:      ReplicationModeAsync,
 		RingVirtualNodes:     150,
 		MetricsAddr:          ":9091",
@@ -179,7 +184,10 @@ func applyYAML(cfg *Config, raw *rawYAMLConfig) {
 		cfg.MaxRetries = raw.MaxRetries
 	}
 	if raw.BackpressurePolicy != "" {
-		cfg.BackpressurePolicy = raw.BackpressurePolicy
+		cfg.BackpressurePolicy = NormalizePolicy(string(raw.BackpressurePolicy))
+	}
+	if raw.BlockTimeout > 0 {
+		cfg.BlockTimeout = raw.BlockTimeout
 	}
 	if raw.ReplicationMode != "" {
 		cfg.ReplicationMode = raw.ReplicationMode
@@ -189,6 +197,20 @@ func applyYAML(cfg *Config, raw *rawYAMLConfig) {
 	}
 	if raw.MetricsAddr != "" {
 		cfg.MetricsAddr = raw.MetricsAddr
+	}
+}
+
+// NormalizePolicy normalizes backpressure policy strings (handling hyphen and underscore variants).
+func NormalizePolicy(p string) BackpressurePolicy {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "block":
+		return PolicyBlock
+	case "drop-oldest", "drop_oldest":
+		return PolicyDropOldest
+	case "disconnect":
+		return PolicyDisconnect
+	default:
+		return BackpressurePolicy(p)
 	}
 }
 
@@ -234,7 +256,12 @@ func applyEnv(cfg *Config) {
 		}
 	}
 	if v := getEnv("PUBSUB_BACKPRESSURE_POLICY", "BEACON_BACKPRESSURE_POLICY"); v != "" {
-		cfg.BackpressurePolicy = BackpressurePolicy(v)
+		cfg.BackpressurePolicy = NormalizePolicy(v)
+	}
+	if v := getEnv("PUBSUB_BLOCK_TIMEOUT", "BEACON_BLOCK_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.BlockTimeout = d
+		}
 	}
 	if v := getEnv("PUBSUB_REPLICATION_MODE"); v != "" {
 		cfg.ReplicationMode = ReplicationMode(v)
@@ -306,11 +333,15 @@ func (c *Config) Validate() error {
 	if c.MaxRetries < 0 {
 		return fmt.Errorf("config: max_retries must be non-negative, got %d", c.MaxRetries)
 	}
+	c.BackpressurePolicy = NormalizePolicy(string(c.BackpressurePolicy))
 	switch c.BackpressurePolicy {
 	case PolicyBlock, PolicyDropOldest, PolicyDisconnect:
 	default:
 		return fmt.Errorf("config: unknown backpressure_policy %q (must be block, drop-oldest, or disconnect)",
 			c.BackpressurePolicy)
+	}
+	if c.BlockTimeout <= 0 {
+		c.BlockTimeout = 500 * time.Millisecond
 	}
 	switch c.ReplicationMode {
 	case ReplicationModeSync, ReplicationModeAsync:
