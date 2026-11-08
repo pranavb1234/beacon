@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "beacon"
+    static_configs:
+      - targets:
+          - "broker1:9091"
+          - "broker2:9091"
+          - "broker3:9091"
+    # Attach node_id label from the target so dashboards can filter per node.
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "(broker[0-9]+):.*"
+        target_label: node_id
+        replacement: "${1}"

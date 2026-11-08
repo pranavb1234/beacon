@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Go binaries
+/beacon-broker
+/beacon-publisher
+/beacon-subscriber
+/beacon-bench
+
+# Go test cache
+*.test
+
+# Generated proto code (regenerate with: make proto)
+proto/pubsubv1/
+
+# Editor
+.idea/
+.vscode/
+*.swp
