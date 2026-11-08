@@ -253,3 +253,4 @@ func TestResume_ReconnectNoLossOrDup(t *testing.T) {
 		assert.Equal(t, uint64(i+1), receivedSeqs[i])
 	}
 }
+

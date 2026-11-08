@@ -162,3 +162,4 @@ func TestConsumerGroup_MixedBroadcastAndGroup(t *testing.T) {
 	assert.Equal(t, 5, len(g1.Send))
 	assert.Equal(t, 5, len(g2.Send))
 }
+
