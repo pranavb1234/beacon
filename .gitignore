@@ -1,20 +1,30 @@
-# macOS
-.DS_Store
-**/.DS_Store
-
-# Go binaries
-/beacon-broker
-/beacon-publisher
-/beacon-subscriber
-/beacon-bench
-
-# Go test cache
+# Binaries and build outputs
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
 *.test
+*.out
 
-# Generated proto code (regenerate with: make proto)
+# Data and log files
+data/
+*.data
+*.db
+*.log
+
+# Generated protobuf files (regenerated via `make proto`)
 proto/pubsubv1/
 
-# Editor
+# Go workspace and cache
+vendor/
+.cache/
+
+# OS and Editor metadata
+.DS_Store
+**/.DS_Store
 .idea/
 .vscode/
 *.swp
+*~

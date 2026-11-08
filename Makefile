@@ -1,54 +1,38 @@
-.PHONY: proto build test lint docker-up docker-down clean help
+.PHONY: build test proto lint run-broker clean
 
-# ── Variables ──────────────────────────────────────────────────────────────────
-MODULE      := github.com/pranavb1234/beacon
-GO          := go
-GOFLAGS     := -race
-TIMEOUT     := 120s
-DOCKER_COMP := docker compose -f deploy/docker-compose.yml
+# Build all binaries into bin/
+build:
+	@mkdir -p bin
+	go build -o bin/broker ./cmd/broker
+	go build -o bin/publisher ./cmd/publisher
+	go build -o bin/subscriber ./cmd/subscriber
+	go build -o bin/bench ./cmd/bench
 
-# ── Default target ─────────────────────────────────────────────────────────────
-help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
-		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
+# Run all tests with race detection
+test:
+	go test -race ./...
 
-# ── Proto generation ───────────────────────────────────────────────────────────
-proto: ## Generate Go code from proto/pubsub.proto using buf
-	cd proto && buf generate
-	@echo "✓ proto generated"
+# Generate protobuf code
+proto:
+	@if [ -d "proto" ] && command -v buf >/dev/null 2>&1; then \
+		cd proto && buf generate && echo "Proto generated with buf"; \
+	elif [ -d "proto" ] && command -v protoc >/dev/null 2>&1; then \
+		protoc --go_out=. --go-grpc_out=. proto/*.proto && echo "Proto generated with protoc"; \
+	else \
+		echo "Skipping proto generation: buf/protoc tool or proto directory not found"; \
+	fi
 
-proto-lint: ## Lint the proto files
-	cd proto && buf lint
-
-# ── Go targets ─────────────────────────────────────────────────────────────────
-build: ## Build all binaries
-	$(GO) build ./...
-
-test: ## Run all tests with race detector
-	$(GO) test $(GOFLAGS) -timeout $(TIMEOUT) -count=1 ./...
-
-test-short: ## Run only short tests (skips slow distribution tests)
-	$(GO) test $(GOFLAGS) -short -timeout $(TIMEOUT) ./...
-
-lint: ## Run go vet (add staticcheck / golangci-lint as desired)
-	$(GO) vet ./...
+# Lint code using go vet and static analysis tools if present
+lint:
+	go vet ./...
 	@if command -v staticcheck >/dev/null 2>&1; then staticcheck ./...; fi
+	@if command -v golangci-lint >/dev/null 2>&1; then golangci-lint run; fi
 
-tidy: ## Tidy and verify go.mod
-	$(GO) mod tidy
-	$(GO) mod verify
+# Run broker locally
+run-broker:
+	go run ./cmd/broker
 
-# ── Docker targets ─────────────────────────────────────────────────────────────
-docker-up: ## Build images and start the 3-node cluster + Prometheus + Grafana
-	$(DOCKER_COMP) up --build -d
-
-docker-down: ## Stop and remove containers
-	$(DOCKER_COMP) down
-
-docker-logs: ## Stream logs from all containers
-	$(DOCKER_COMP) logs -f
-
-# ── Cleanup ────────────────────────────────────────────────────────────────────
-clean: ## Remove generated proto files and binaries
-	rm -rf proto/pubsubv1/
-	$(GO) clean -cache
+# Clean binaries and caches
+clean:
+	rm -rf bin/ proto/pubsubv1/
+	go clean -cache

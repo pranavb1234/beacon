@@ -1,0 +1,17 @@
+# Pub/Sub Broker Configuration
+node_id: "node-1"
+listen_address: "0.0.0.0:9001"
+peers:
+  - id: "node-2"
+    address: "127.0.0.1:9002"
+  - id: "node-3"
+    address: "127.0.0.1:9003"
+heartbeat_interval: 1s
+heartbeat_timeout: 5s
+buffer_size_per_topic: 10000
+subscriber_buffer_size: 1000
+ack_timeout: 3s
+max_retries: 3
+backpressure_policy: "block"      # block | drop-oldest | disconnect
+replication_mode: "async"         # sync | async
+
