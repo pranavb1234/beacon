@@ -147,7 +147,7 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.Broker_SubscribeS
 	}
 }
 
-// Ack accepts and logs message acknowledgments.
+// Ack accepts, logs, and processes message acknowledgments.
 func (s *Server) Ack(ctx context.Context, req *pb.AckRequest) (*pb.AckResponse, error) {
 	s.logger.Info("received ack",
 		"topic", req.GetTopic(),
@@ -155,6 +155,7 @@ func (s *Server) Ack(ctx context.Context, req *pb.AckRequest) (*pb.AckResponse, 
 		"seq", req.GetSeq(),
 		"group", req.GetGroup(),
 	)
+	s.manager.Acknowledge(req.GetTopic(), req.GetSubscriberId(), req.GetSeq())
 	return &pb.AckResponse{}, nil
 }
 
@@ -189,3 +190,4 @@ func (s *Server) Addr() string {
 	}
 	return ""
 }
+

@@ -1,10 +1,11 @@
 // Package broker implements the core topic management, message sequencing,
-// fan-out, and configurable backpressure engine for a single broker node.
+// ring-buffer storage, fan-out, configurable backpressure, and in-flight ACK tracking
+// for a single broker node.
 //
 // Thread Safety & Lock Hierarchy:
 // To prevent deadlocks, locks must strictly be acquired in the following order:
 //
-//	Manager.mu (RWMutex) -> Topic.mu (RWMutex) -> Subscriber.mu (Mutex)
+//	Manager.mu (RWMutex) -> Topic.mu (RWMutex) -> Subscriber.mu (Mutex) -> Subscriber.inFlightMu (Mutex)
 //
 // Lock invariants:
 //  1. Manager.mu protects the `topics` registry map.
@@ -12,10 +13,10 @@
 //  3. Subscriber.mu protects the subscriber's `closed` state to guarantee that
 //     message delivery never sends on a closed channel, and that channel closure
 //     happens exactly once.
-//  4. Sequence numbers are assigned atomically via atomic.AddUint64, ensuring
-//     lock-free monotonic sequence ordering even under heavy concurrent publishing.
-//  5. Never acquire Manager.mu while holding Topic.mu.
-//  6. Never acquire Topic.mu while holding Subscriber.mu.
+//  4. Subscriber.inFlightMu protects the in-flight tracking map and retry state.
+//  5. Sequence numbers are assigned atomically via atomic.AddUint64.
+//  6. Never acquire Manager.mu while holding Topic.mu.
+//  7. Never acquire Topic.mu while holding Subscriber.mu.
 package broker
 
 import (
@@ -91,7 +92,6 @@ func BlockDelivery(sub *Subscriber, msg *Message, timeout time.Duration) Deliver
 	case sub.Send <- msg:
 		return DeliverySuccess
 	case <-timer.C:
-		// Publisher timed out waiting for subscriber to drain buffer
 		return DeliveryDropped
 	}
 }
@@ -114,9 +114,8 @@ func DropOldestDelivery(sub *Subscriber, msg *Message, _ time.Duration) Delivery
 	// Enqueue the new message
 	select {
 	case sub.Send <- msg:
-		return DeliveryDropped // older message dropped to enqueue new one
+		return DeliveryDropped
 	default:
-		// Fallback if another push raced
 		return DeliveryDropped
 	}
 }
@@ -146,12 +145,22 @@ func PolicyHandler(policy config.BackpressurePolicy) BackpressurePolicyHandler {
 	}
 }
 
+// InFlightMessage tracks an unacknowledged message awaiting an ACK.
+type InFlightMessage struct {
+	Message  *Message
+	Deadline time.Time
+	Retries  int
+}
+
 // Stats holds operational telemetry counters for the broker.
 type Stats struct {
 	Published    uint64 `json:"published"`
 	Delivered    uint64 `json:"delivered"`
 	Dropped      uint64 `json:"dropped"`
 	Disconnected uint64 `json:"disconnected"`
+	DeadLetter   uint64 `json:"dead_letter"`
+	Retried      uint64 `json:"retried"`
+	Acked        uint64 `json:"acked"`
 }
 
 // Subscriber represents an active subscriber to a topic.
@@ -165,6 +174,9 @@ type Subscriber struct {
 	err   error
 	errMu sync.RWMutex
 
+	inFlight   map[uint64]*InFlightMessage
+	inFlightMu sync.Mutex
+
 	mu     sync.Mutex
 	closed bool
 	once   sync.Once
@@ -177,11 +189,12 @@ func NewSubscriber(id string, bufferSize int) *Subscriber {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Subscriber{
-		ID:     id,
-		Send:   make(chan *Message, bufferSize),
-		Done:   make(chan struct{}),
-		Ctx:    ctx,
-		Cancel: cancel,
+		ID:       id,
+		Send:     make(chan *Message, bufferSize),
+		Done:     make(chan struct{}),
+		Ctx:      ctx,
+		Cancel:   cancel,
+		inFlight: make(map[uint64]*InFlightMessage),
 	}
 }
 
@@ -200,9 +213,42 @@ func (s *Subscriber) setErr(err error) {
 	s.errMu.Unlock()
 }
 
-// Deliver attempts to deliver a message using the given backpressure handler.
-// It acquires Subscriber.mu to guarantee that a send is never attempted on a closed channel.
-func (s *Subscriber) Deliver(msg *Message, handler BackpressurePolicyHandler, timeout time.Duration) DeliveryResult {
+// RecordInFlight registers a message in the in-flight tracking map.
+func (s *Subscriber) RecordInFlight(msg *Message, timeout time.Duration) {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	s.inFlight[msg.Seq] = &InFlightMessage{
+		Message:  msg,
+		Deadline: time.Now().Add(timeout),
+		Retries:  0,
+	}
+}
+
+// Acknowledge removes a message sequence from in-flight tracking.
+func (s *Subscriber) Acknowledge(seq uint64) bool {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	if _, exists := s.inFlight[seq]; exists {
+		delete(s.inFlight, seq)
+		return true
+	}
+	return false
+}
+
+// InFlightCount returns the number of currently unacknowledged messages.
+func (s *Subscriber) InFlightCount() int {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	return len(s.inFlight)
+}
+
+// Deliver attempts to deliver a message using the given backpressure handler and records in-flight state.
+func (s *Subscriber) Deliver(
+	msg *Message,
+	handler BackpressurePolicyHandler,
+	timeout time.Duration,
+	ackTimeout time.Duration,
+) DeliveryResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -212,7 +258,33 @@ func (s *Subscriber) Deliver(msg *Message, handler BackpressurePolicyHandler, ti
 
 	result := handler.Deliver(s, msg, timeout)
 	if result == DeliveryDisconnected {
-		// Cleanly close subscriber channel immediately on disconnect
+		if s.Cancel != nil {
+			s.Cancel()
+		}
+		s.closed = true
+		close(s.Done)
+		close(s.Send)
+	} else if result == DeliverySuccess && ackTimeout > 0 {
+		s.RecordInFlight(msg, ackTimeout)
+	}
+	return result
+}
+
+// DeliverRedelivery attempts redelivery of an in-flight message without creating duplicate tracking entries.
+func (s *Subscriber) DeliverRedelivery(
+	msg *Message,
+	handler BackpressurePolicyHandler,
+	timeout time.Duration,
+) DeliveryResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return DeliveryDisconnected
+	}
+
+	result := handler.Deliver(s, msg, timeout)
+	if result == DeliveryDisconnected {
 		if s.Cancel != nil {
 			s.Cancel()
 		}
@@ -224,7 +296,6 @@ func (s *Subscriber) Deliver(msg *Message, handler BackpressurePolicyHandler, ti
 }
 
 // Close closes the subscriber's channels exactly once and cancels its context.
-// Safe to call multiple times and from multiple concurrent goroutines.
 func (s *Subscriber) Close() {
 	s.once.Do(func() {
 		if s.Cancel != nil {
@@ -247,12 +318,18 @@ func (s *Subscriber) IsClosed() bool {
 	return s.closed
 }
 
-// Topic holds state for a single topic, including its subscribers and next sequence counter.
+// Topic holds state for a single topic, including its ring buffer, subscribers, and next sequence counter.
 type Topic struct {
 	Name        string
 	nextSeq     uint64
 	subscribers map[string]*Subscriber
+	ringBuffer  *RingBuffer
 	mu          sync.RWMutex
+}
+
+// RingBuffer returns the ring buffer storing recent messages for this topic.
+func (t *Topic) RingBuffer() *RingBuffer {
+	return t.ringBuffer
 }
 
 // NextSeq returns the current sequence counter value.
@@ -267,7 +344,7 @@ func (t *Topic) SubscribersCount() int {
 	return len(t.subscribers)
 }
 
-// Manager coordinates topics, publishers, subscribers, and backpressure on a broker node.
+// Manager coordinates topics, publishers, subscribers, backpressure, and ACK tracking.
 type Manager struct {
 	mu     sync.RWMutex
 	topics map[string]*Topic
@@ -279,6 +356,9 @@ type Manager struct {
 	deliveredCount    uint64
 	droppedCount      uint64
 	disconnectedCount uint64
+	deadLetterCount   uint64
+	retriedCount      uint64
+	ackedCount        uint64
 }
 
 // Broker is an alias for Manager for compatibility.
@@ -308,6 +388,9 @@ func (m *Manager) Stats() Stats {
 		Delivered:    atomic.LoadUint64(&m.deliveredCount),
 		Dropped:      atomic.LoadUint64(&m.droppedCount),
 		Disconnected: atomic.LoadUint64(&m.disconnectedCount),
+		DeadLetter:   atomic.LoadUint64(&m.deadLetterCount),
+		Retried:      atomic.LoadUint64(&m.retriedCount),
+		Acked:        atomic.LoadUint64(&m.ackedCount),
 	}
 }
 
@@ -327,9 +410,15 @@ func (m *Manager) GetOrCreateTopic(name string) *Topic {
 		return t
 	}
 
+	bufCap := m.cfg.BufferSizePerTopic
+	if bufCap <= 0 {
+		bufCap = 10000
+	}
+
 	t := &Topic{
 		Name:        name,
 		subscribers: make(map[string]*Subscriber),
+		ringBuffer:  NewRingBuffer(bufCap),
 	}
 	m.topics[name] = t
 	return t
@@ -340,7 +429,7 @@ func (m *Manager) getOrCreateTopic(name string) *Topic {
 	return m.GetOrCreateTopic(name)
 }
 
-// AddSubscriber registers a subscriber to a topic.
+// AddSubscriber registers a subscriber to a topic and starts its background retry scanner.
 func (m *Manager) AddSubscriber(topicName string, sub *Subscriber) error {
 	if sub == nil {
 		return ErrNilSubscriber
@@ -349,14 +438,14 @@ func (m *Manager) AddSubscriber(topicName string, sub *Subscriber) error {
 	t := m.GetOrCreateTopic(topicName)
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	t.subscribers[sub.ID] = sub
+	t.mu.Unlock()
+
+	m.startRetryScanner(sub)
 	return nil
 }
 
 // RemoveSubscriber unregisters a subscriber from a topic and safely closes its channels.
-// Removal closes the subscriber channel exactly once and prevents any further sends.
 func (m *Manager) RemoveSubscriber(topicName string, subID string) error {
 	m.mu.RLock()
 	t, exists := m.topics[topicName]
@@ -381,7 +470,30 @@ func (m *Manager) RemoveSubscriber(topicName string, subID string) error {
 	return nil
 }
 
-// Publish assigns the next monotonic sequence number and fans out the message to all active subscribers.
+// Acknowledge records an ACK from a subscriber and removes the message from in-flight tracking.
+func (m *Manager) Acknowledge(topicName, subID string, seq uint64) bool {
+	m.mu.RLock()
+	t, exists := m.topics[topicName]
+	m.mu.RUnlock()
+	if !exists {
+		return false
+	}
+
+	t.mu.RLock()
+	sub, exists := t.subscribers[subID]
+	t.mu.RUnlock()
+	if !exists {
+		return false
+	}
+
+	ok := sub.Acknowledge(seq)
+	if ok {
+		atomic.AddUint64(&m.ackedCount, 1)
+	}
+	return ok
+}
+
+// Publish assigns the next sequence number, stores it in the ring buffer, and fans out to subscribers.
 func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
 	t := m.GetOrCreateTopic(topicName)
 
@@ -394,6 +506,9 @@ func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
 		Payload:     payload,
 		TimestampNS: time.Now().UnixNano(),
 	}
+
+	// Append to topic ring buffer
+	t.ringBuffer.Append(msg)
 
 	// Snapshot subscribers under read lock
 	t.mu.RLock()
@@ -408,10 +523,14 @@ func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
 	}
+	ackTimeout := m.cfg.AckTimeout
+	if ackTimeout <= 0 {
+		ackTimeout = 1 * time.Second
+	}
 
 	var disconnectedIDs []string
 	for _, s := range subs {
-		result := s.Deliver(msg, handler, timeout)
+		result := s.Deliver(msg, handler, timeout, ackTimeout)
 		switch result {
 		case DeliverySuccess:
 			atomic.AddUint64(&m.deliveredCount, 1)
@@ -423,7 +542,7 @@ func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
 		}
 	}
 
-	// Remove any disconnected subscribers from topic
+	// Prune disconnected subscribers from topic
 	if len(disconnectedIDs) > 0 {
 		t.mu.Lock()
 		for _, id := range disconnectedIDs {
@@ -433,6 +552,85 @@ func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
 	}
 
 	return seq, nil
+}
+
+// startRetryScanner launches a background scanner checking for expired in-flight ACK deadlines.
+func (m *Manager) startRetryScanner(sub *Subscriber) {
+	go func() {
+		baseTimeout := m.cfg.AckTimeout
+		if baseTimeout <= 0 {
+			baseTimeout = 1 * time.Second
+		}
+		maxRetries := m.cfg.MaxRetries
+		if maxRetries < 0 {
+			maxRetries = 3
+		}
+		blockTimeout := m.cfg.BlockTimeout
+		if blockTimeout <= 0 {
+			blockTimeout = 500 * time.Millisecond
+		}
+		handler := PolicyHandler(m.cfg.BackpressurePolicy)
+
+		tickInterval := baseTimeout / 4
+		if tickInterval < 10*time.Millisecond {
+			tickInterval = 10 * time.Millisecond
+		} else if tickInterval > 200*time.Millisecond {
+			tickInterval = 200 * time.Millisecond
+		}
+
+		ticker := time.NewTicker(tickInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-sub.Ctx.Done():
+				return
+			case <-sub.Done:
+				return
+			case <-ticker.C:
+				m.scanInFlightRetries(sub, baseTimeout, maxRetries, blockTimeout, handler)
+			}
+		}
+	}()
+}
+
+// scanInFlightRetries scans subscriber's in-flight messages and redelivers with exponential backoff.
+func (m *Manager) scanInFlightRetries(
+	sub *Subscriber,
+	baseTimeout time.Duration,
+	maxRetries int,
+	blockTimeout time.Duration,
+	handler BackpressurePolicyHandler,
+) {
+	now := time.Now()
+
+	sub.inFlightMu.Lock()
+	var toRedeliver []*InFlightMessage
+	var toDeadLetter []*Message
+
+	for seq, item := range sub.inFlight {
+		if now.After(item.Deadline) {
+			if item.Retries >= maxRetries {
+				delete(sub.inFlight, seq)
+				toDeadLetter = append(toDeadLetter, item.Message)
+			} else {
+				item.Retries++
+				backoff := baseTimeout * (1 << item.Retries)
+				item.Deadline = now.Add(backoff)
+				toRedeliver = append(toRedeliver, item)
+			}
+		}
+	}
+	sub.inFlightMu.Unlock()
+
+	for range toDeadLetter {
+		atomic.AddUint64(&m.deadLetterCount, 1)
+	}
+
+	for _, item := range toRedeliver {
+		atomic.AddUint64(&m.retriedCount, 1)
+		sub.DeliverRedelivery(item.Message, handler, blockTimeout)
+	}
 }
 
 // Subscribe is a convenience method for registering a subscriber with a given ID.
