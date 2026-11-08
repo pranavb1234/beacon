@@ -4,15 +4,77 @@ package pubsub.v1;
 
 option go_package = "github.com/pranavb1234/beacon/internal/pb;pb";
 
-// PingService provides a minimal health/ping RPC placeholder.
-service PingService {
-  rpc Ping(PingRequest) returns (PingResponse);
+// Broker provides single-node pub/sub streaming capabilities over gRPC.
+service Broker {
+  // Publish sends a payload to a topic and returns its assigned sequence number.
+  rpc Publish(PublishRequest) returns (PublishResponse);
+
+  // Subscribe opens a server-streaming connection to receive messages on a topic.
+  rpc Subscribe(SubscribeRequest) returns (stream Message);
+
+  // Ack acknowledges successful receipt and processing of a message by a subscriber.
+  rpc Ack(AckRequest) returns (AckResponse);
 }
 
-message PingRequest {
-  string message = 1;
+// PublishRequest contains the message payload to be published to a specific topic.
+message PublishRequest {
+  // topic is the target topic name where the message will be published.
+  string topic = 1;
+
+  // payload is the raw binary content of the message.
+  bytes payload = 2;
 }
 
-message PingResponse {
-  string message = 1;
+// PublishResponse acknowledges message publication with its assigned monotonic sequence number.
+message PublishResponse {
+  // sequence is the unique, monotonically increasing sequence number assigned to this message within the topic.
+  uint64 sequence = 1;
 }
+
+// SubscribeRequest defines subscription parameters for streaming messages from a topic.
+message SubscribeRequest {
+  // topic is the name of the topic to subscribe to.
+  string topic = 1;
+
+  // group is the optional consumer group ID. When provided, messages are distributed among group members.
+  string group = 2;
+
+  // from_seq is the sequence number to start streaming from (0 indicates new messages only).
+  uint64 from_seq = 3;
+
+  // subscriber_id is the unique identifier for this subscriber connection.
+  string subscriber_id = 4;
+}
+
+// Message is an individual event streamed to subscribers.
+message Message {
+  // topic is the name of the topic the message belongs to.
+  string topic = 1;
+
+  // seq is the sequence number of this message within the topic.
+  uint64 seq = 2;
+
+  // payload is the raw message content published by the producer.
+  bytes payload = 3;
+
+  // timestamp_ns is the publication time recorded by the broker as Unix nanoseconds.
+  int64 timestamp_ns = 4;
+}
+
+// AckRequest informs the broker that a subscriber has successfully handled a message.
+message AckRequest {
+  // topic is the topic name of the acknowledged message.
+  string topic = 1;
+
+  // group is the consumer group ID if subscribing as part of a group.
+  string group = 2;
+
+  // subscriber_id is the unique ID of the acknowledging subscriber.
+  string subscriber_id = 3;
+
+  // seq is the sequence number of the message being acknowledged.
+  uint64 seq = 4;
+}
+
+// AckResponse is an empty confirmation acknowledging message processing.
+message AckResponse {}
