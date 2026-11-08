@@ -1,5 +1,7 @@
 .PHONY: build test proto lint run-broker clean
 
+BUF := $(shell which buf 2>/dev/null || echo $(shell go env GOPATH)/bin/buf)
+
 # Build all binaries into bin/
 build:
 	@mkdir -p bin
@@ -15,11 +17,16 @@ test:
 # Generate protobuf and gRPC Go code into internal/pb
 proto:
 	@mkdir -p internal/pb
-	protoc --proto_path=proto \
-		--go_out=internal/pb --go_opt=paths=source_relative \
-		--go-grpc_out=internal/pb --go-grpc_opt=paths=source_relative \
-		proto/pubsub.proto
-	@echo "✓ Proto generated into internal/pb"
+	@if [ -x "$(BUF)" ]; then \
+		cd proto && $(BUF) generate && echo "✓ Proto generated into internal/pb with buf"; \
+	elif command -v protoc >/dev/null 2>&1; then \
+		protoc --proto_path=proto \
+			--go_out=internal/pb --go_opt=paths=source_relative \
+			--go-grpc_out=internal/pb --go-grpc_opt=paths=source_relative \
+			proto/pubsub.proto && echo "✓ Proto generated into internal/pb with protoc"; \
+	else \
+		echo "error: neither buf nor protoc found"; exit 1; \
+	fi
 
 # Lint code using go vet and static analysis tools if present
 lint:
@@ -33,5 +40,5 @@ run-broker:
 
 # Clean binaries and caches
 clean:
-	rm -rf bin/ internal/pb/ proto/gen/ proto/pubsubv1/
+	rm -rf bin/ proto/gen/ proto/pubsubv1/
 	go clean -cache

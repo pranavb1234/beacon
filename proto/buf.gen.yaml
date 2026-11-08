@@ -2,17 +2,12 @@ version: v2
 plugins:
   # Generates Go message types (*.pb.go)
   - remote: buf.build/protocolbuffers/go:v1.34.2
-    out: ..
+    out: ../internal/pb
     opt:
       - paths=source_relative
-      - module=github.com/pranavb1234/beacon
 
   # Generates gRPC service stubs (*_grpc.pb.go)
-  # require_unimplemented_servers=false lets us embed the struct without
-  # implementing every method in Phase 0 — we add them incrementally.
   - remote: buf.build/grpc/go:v1.4.0
-    out: ..
+    out: ../internal/pb
     opt:
       - paths=source_relative
-      - module=github.com/pranavb1234/beacon
-      - require_unimplemented_servers=false

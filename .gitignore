@@ -16,7 +16,6 @@ data/
 
 # Generated protobuf files (regenerated via `make proto`)
 proto/pubsubv1/
-internal/pb/
 proto/gen/
 
 # Go workspace and cache
