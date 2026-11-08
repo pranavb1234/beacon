@@ -1,22 +1,19 @@
 // Package broker implements the core topic management, message sequencing,
-// ring-buffer storage, fan-out, configurable backpressure, and in-flight ACK tracking
-// for a single broker node.
+// ring-buffer storage, consumer groups, fan-out, configurable backpressure,
+// and in-flight ACK tracking for a single broker node.
 //
 // Thread Safety & Lock Hierarchy:
 // To prevent deadlocks, locks must strictly be acquired in the following order:
 //
-//	Manager.mu (RWMutex) -> Topic.mu (RWMutex) -> Subscriber.mu (Mutex) -> Subscriber.inFlightMu (Mutex)
+//	Manager.mu (RWMutex) -> Topic.mu (RWMutex) -> ConsumerGroup.mu (Mutex) -> Subscriber.mu (Mutex) -> Subscriber.inFlightMu (Mutex)
 //
 // Lock invariants:
 //  1. Manager.mu protects the `topics` registry map.
-//  2. Topic.mu protects the `subscribers` map and subscriber membership.
-//  3. Subscriber.mu protects the subscriber's `closed` state to guarantee that
-//     message delivery never sends on a closed channel, and that channel closure
-//     happens exactly once.
-//  4. Subscriber.inFlightMu protects the in-flight tracking map and retry state.
-//  5. Sequence numbers are assigned atomically via atomic.AddUint64.
-//  6. Never acquire Manager.mu while holding Topic.mu.
-//  7. Never acquire Topic.mu while holding Subscriber.mu.
+//  2. Topic.mu protects `subscribers`, `broadcastSubs`, and `groups`.
+//  3. ConsumerGroup.mu protects group members and committed offset calculation.
+//  4. Subscriber.mu protects `closed` state to guarantee that sends are never attempted on a closed channel.
+//  5. Subscriber.inFlightMu protects in-flight tracking and retry deadlines.
+//  6. Sequence numbers are assigned atomically via atomic.AddUint64.
 package broker
 
 import (
@@ -53,11 +50,8 @@ type Message struct {
 type DeliveryResult int
 
 const (
-	// DeliverySuccess indicates the message was enqueued into the subscriber buffer.
 	DeliverySuccess DeliveryResult = iota
-	// DeliveryDropped indicates a message was dropped (either evicted or rejected due to timeout).
 	DeliveryDropped
-	// DeliveryDisconnected indicates the subscriber was disconnected due to buffer exhaustion.
 	DeliveryDisconnected
 )
 
@@ -76,7 +70,6 @@ func (f BackpressureFunc) Deliver(sub *Subscriber, msg *Message, timeout time.Du
 
 // BlockDelivery waits with a timeout until the subscriber channel has room.
 func BlockDelivery(sub *Subscriber, msg *Message, timeout time.Duration) DeliveryResult {
-	// Fast path: try immediate send
 	select {
 	case sub.Send <- msg:
 		return DeliverySuccess
@@ -98,20 +91,17 @@ func BlockDelivery(sub *Subscriber, msg *Message, timeout time.Duration) Deliver
 
 // DropOldestDelivery evicts the oldest queued message in the subscriber buffer and enqueues the new one.
 func DropOldestDelivery(sub *Subscriber, msg *Message, _ time.Duration) DeliveryResult {
-	// Fast path: try immediate send
 	select {
 	case sub.Send <- msg:
 		return DeliverySuccess
 	default:
 	}
 
-	// Buffer is full: drain oldest message if possible
 	select {
 	case <-sub.Send:
 	default:
 	}
 
-	// Enqueue the new message
 	select {
 	case sub.Send <- msg:
 		return DeliveryDropped
@@ -165,11 +155,12 @@ type Stats struct {
 
 // Subscriber represents an active subscriber to a topic.
 type Subscriber struct {
-	ID     string
-	Send   chan *Message
-	Done   chan struct{}
-	Ctx    context.Context
-	Cancel context.CancelFunc
+	ID      string
+	GroupID string
+	Send    chan *Message
+	Done    chan struct{}
+	Ctx     context.Context
+	Cancel  context.CancelFunc
 
 	err   error
 	errMu sync.RWMutex
@@ -242,6 +233,18 @@ func (s *Subscriber) InFlightCount() int {
 	return len(s.inFlight)
 }
 
+// DrainInFlight extracts and clears all unacknowledged in-flight messages.
+func (s *Subscriber) DrainInFlight() []*InFlightMessage {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	items := make([]*InFlightMessage, 0, len(s.inFlight))
+	for _, it := range s.inFlight {
+		items = append(items, it)
+	}
+	s.inFlight = make(map[uint64]*InFlightMessage)
+	return items
+}
+
 // Deliver attempts to deliver a message using the given backpressure handler and records in-flight state.
 func (s *Subscriber) Deliver(
 	msg *Message,
@@ -270,7 +273,7 @@ func (s *Subscriber) Deliver(
 	return result
 }
 
-// DeliverRedelivery attempts redelivery of an in-flight message without creating duplicate tracking entries.
+// DeliverRedelivery attempts redelivery without creating duplicate in-flight entries.
 func (s *Subscriber) DeliverRedelivery(
 	msg *Message,
 	handler BackpressurePolicyHandler,
@@ -318,13 +321,102 @@ func (s *Subscriber) IsClosed() bool {
 	return s.closed
 }
 
-// Topic holds state for a single topic, including its ring buffer, subscribers, and next sequence counter.
+// ConsumerGroup manages a pool of subscribers sharing messages round-robin on a topic.
+type ConsumerGroup struct {
+	Name            string
+	TopicName       string
+	members         []*Subscriber
+	memberIndex     int
+	committedOffset uint64
+	ackedSeqs       map[uint64]bool
+	mu              sync.Mutex
+}
+
+// NewConsumerGroup creates a new ConsumerGroup for a topic.
+func NewConsumerGroup(name, topic string) *ConsumerGroup {
+	return &ConsumerGroup{
+		Name:      name,
+		TopicName: topic,
+		ackedSeqs: make(map[uint64]bool),
+	}
+}
+
+// AddMember adds a subscriber to the group.
+func (cg *ConsumerGroup) AddMember(sub *Subscriber) {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+	cg.members = append(cg.members, sub)
+}
+
+// RemoveMember removes a subscriber from the group.
+func (cg *ConsumerGroup) RemoveMember(subID string) {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+	for i, m := range cg.members {
+		if m.ID == subID {
+			cg.members = append(cg.members[:i], cg.members[i+1:]...)
+			break
+		}
+	}
+}
+
+// NextMember returns the next alive member in round-robin order.
+func (cg *ConsumerGroup) NextMember() *Subscriber {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+	if len(cg.members) == 0 {
+		return nil
+	}
+	sub := cg.members[cg.memberIndex%len(cg.members)]
+	cg.memberIndex++
+	return sub
+}
+
+// MemberCount returns the number of active members in the group.
+func (cg *ConsumerGroup) MemberCount() int {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+	return len(cg.members)
+}
+
+// CommittedOffset returns the highest contiguous acknowledged sequence number for this group.
+func (cg *ConsumerGroup) CommittedOffset() uint64 {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+	return cg.committedOffset
+}
+
+// Acknowledge updates the group's highest contiguous acknowledged sequence number.
+func (cg *ConsumerGroup) Acknowledge(seq uint64) uint64 {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+
+	if seq <= cg.committedOffset {
+		return cg.committedOffset
+	}
+
+	cg.ackedSeqs[seq] = true
+	for {
+		next := cg.committedOffset + 1
+		if cg.ackedSeqs[next] {
+			delete(cg.ackedSeqs, next)
+			cg.committedOffset = next
+		} else {
+			break
+		}
+	}
+	return cg.committedOffset
+}
+
+// Topic holds state for a single topic, including ring buffer, subscribers, and consumer groups.
 type Topic struct {
-	Name        string
-	nextSeq     uint64
-	subscribers map[string]*Subscriber
-	ringBuffer  *RingBuffer
-	mu          sync.RWMutex
+	Name          string
+	nextSeq       uint64
+	subscribers   map[string]*Subscriber
+	broadcastSubs map[string]*Subscriber
+	groups        map[string]*ConsumerGroup
+	ringBuffer    *RingBuffer
+	mu            sync.RWMutex
 }
 
 // RingBuffer returns the ring buffer storing recent messages for this topic.
@@ -337,14 +429,29 @@ func (t *Topic) NextSeq() uint64 {
 	return atomic.LoadUint64(&t.nextSeq)
 }
 
-// SubscribersCount returns the number of active subscribers on this topic.
+// SubscribersCount returns the total number of active subscribers on this topic.
 func (t *Topic) SubscribersCount() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return len(t.subscribers)
 }
 
-// Manager coordinates topics, publishers, subscribers, backpressure, and ACK tracking.
+// AddSubscriberLocked registers a subscriber assuming Topic.mu is already held.
+func (t *Topic) AddSubscriberLocked(sub *Subscriber) {
+	t.subscribers[sub.ID] = sub
+	if sub.GroupID == "" {
+		t.broadcastSubs[sub.ID] = sub
+	} else {
+		cg, exists := t.groups[sub.GroupID]
+		if !exists {
+			cg = NewConsumerGroup(sub.GroupID, t.Name)
+			t.groups[sub.GroupID] = cg
+		}
+		cg.AddMember(sub)
+	}
+}
+
+// Manager coordinates topics, publishers, subscribers, consumer groups, and retries.
 type Manager struct {
 	mu     sync.RWMutex
 	topics map[string]*Topic
@@ -416,9 +523,11 @@ func (m *Manager) GetOrCreateTopic(name string) *Topic {
 	}
 
 	t := &Topic{
-		Name:        name,
-		subscribers: make(map[string]*Subscriber),
-		ringBuffer:  NewRingBuffer(bufCap),
+		Name:          name,
+		subscribers:   make(map[string]*Subscriber),
+		broadcastSubs: make(map[string]*Subscriber),
+		groups:        make(map[string]*ConsumerGroup),
+		ringBuffer:    NewRingBuffer(bufCap),
 	}
 	m.topics[name] = t
 	return t
@@ -438,14 +547,42 @@ func (m *Manager) AddSubscriber(topicName string, sub *Subscriber) error {
 	t := m.GetOrCreateTopic(topicName)
 
 	t.mu.Lock()
-	t.subscribers[sub.ID] = sub
+	t.AddSubscriberLocked(sub)
+
+	// If group subscriber and group has committedOffset, catch up unconsumed messages from ring buffer
+	var catchUpMsgs []*Message
+	if sub.GroupID != "" {
+		cg := t.groups[sub.GroupID]
+		offset := cg.CommittedOffset()
+		if t.ringBuffer.Len() > 0 && offset < t.ringBuffer.NewestSeq() {
+			if msgs, ok := t.ringBuffer.GetFrom(offset + 1); ok {
+				catchUpMsgs = msgs
+			}
+		}
+	}
 	t.mu.Unlock()
+
+	// Deliver catch-up messages to the joining member
+	if len(catchUpMsgs) > 0 {
+		handler := PolicyHandler(m.cfg.BackpressurePolicy)
+		timeout := m.cfg.BlockTimeout
+		if timeout <= 0 {
+			timeout = 500 * time.Millisecond
+		}
+		ackTimeout := m.cfg.AckTimeout
+		if ackTimeout <= 0 {
+			ackTimeout = 1 * time.Second
+		}
+		for _, msg := range catchUpMsgs {
+			sub.Deliver(msg, handler, timeout, ackTimeout)
+		}
+	}
 
 	m.startRetryScanner(sub)
 	return nil
 }
 
-// RemoveSubscriber unregisters a subscriber from a topic and safely closes its channels.
+// RemoveSubscriber unregisters a subscriber and redistributes any unacked messages to remaining group members.
 func (m *Manager) RemoveSubscriber(topicName string, subID string) error {
 	m.mu.RLock()
 	t, exists := m.topics[topicName]
@@ -457,20 +594,53 @@ func (m *Manager) RemoveSubscriber(topicName string, subID string) error {
 
 	t.mu.Lock()
 	sub, exists := t.subscribers[subID]
-	if exists {
-		delete(t.subscribers, subID)
-	}
-	t.mu.Unlock()
-
 	if !exists {
+		t.mu.Unlock()
 		return ErrSubscriberNotFound
 	}
 
+	delete(t.subscribers, subID)
+	if sub.GroupID == "" {
+		delete(t.broadcastSubs, subID)
+	} else if cg, ok := t.groups[sub.GroupID]; ok {
+		cg.RemoveMember(subID)
+	}
+	t.mu.Unlock()
+
+	// Drain unacknowledged in-flight messages from disconnected subscriber
+	unacked := sub.DrainInFlight()
 	sub.Close()
+
+	// If subscriber was in a group, redistribute its unacked messages to remaining group members
+	if sub.GroupID != "" && len(unacked) > 0 {
+		t.mu.RLock()
+		cg, ok := t.groups[sub.GroupID]
+		t.mu.RUnlock()
+
+		if ok && cg.MemberCount() > 0 {
+			handler := PolicyHandler(m.cfg.BackpressurePolicy)
+			timeout := m.cfg.BlockTimeout
+			if timeout <= 0 {
+				timeout = 500 * time.Millisecond
+			}
+			ackTimeout := m.cfg.AckTimeout
+			if ackTimeout <= 0 {
+				ackTimeout = 1 * time.Second
+			}
+
+			for _, item := range unacked {
+				target := cg.NextMember()
+				if target != nil {
+					target.Deliver(item.Message, handler, timeout, ackTimeout)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
-// Acknowledge records an ACK from a subscriber and removes the message from in-flight tracking.
+// Acknowledge records an ACK and advances group committed offset if part of a consumer group.
 func (m *Manager) Acknowledge(topicName, subID string, seq uint64) bool {
 	m.mu.RLock()
 	t, exists := m.topics[topicName]
@@ -489,11 +659,39 @@ func (m *Manager) Acknowledge(topicName, subID string, seq uint64) bool {
 	ok := sub.Acknowledge(seq)
 	if ok {
 		atomic.AddUint64(&m.ackedCount, 1)
+		if sub.GroupID != "" {
+			t.mu.RLock()
+			cg, okGroup := t.groups[sub.GroupID]
+			t.mu.RUnlock()
+			if okGroup {
+				cg.Acknowledge(seq)
+			}
+		}
 	}
 	return ok
 }
 
-// Publish assigns the next sequence number, stores it in the ring buffer, and fans out to subscribers.
+// GetGroupCommittedOffset returns the committed offset for a (topic, group).
+func (m *Manager) GetGroupCommittedOffset(topicName, group string) uint64 {
+	m.mu.RLock()
+	t, exists := m.topics[topicName]
+	m.mu.RUnlock()
+	if !exists {
+		return 0
+	}
+
+	t.mu.RLock()
+	cg, exists := t.groups[group]
+	t.mu.RUnlock()
+	if !exists {
+		return 0
+	}
+
+	return cg.CommittedOffset()
+}
+
+// Publish assigns the next sequence number, stores it in the ring buffer,
+// broadcasts to independent subscribers, and round-robins to one member per consumer group.
 func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
 	t := m.GetOrCreateTopic(topicName)
 
@@ -510,11 +708,18 @@ func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
 	// Append to topic ring buffer
 	t.ringBuffer.Append(msg)
 
-	// Snapshot subscribers under read lock
+	// Snapshot broadcast subscribers and select one member per consumer group under read lock
 	t.mu.RLock()
-	subs := make([]*Subscriber, 0, len(t.subscribers))
-	for _, s := range t.subscribers {
-		subs = append(subs, s)
+	broadcastList := make([]*Subscriber, 0, len(t.broadcastSubs))
+	for _, s := range t.broadcastSubs {
+		broadcastList = append(broadcastList, s)
+	}
+
+	groupRecipients := make([]*Subscriber, 0, len(t.groups))
+	for _, cg := range t.groups {
+		if member := cg.NextMember(); member != nil {
+			groupRecipients = append(groupRecipients, member)
+		}
 	}
 	t.mu.RUnlock()
 
@@ -528,8 +733,10 @@ func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
 		ackTimeout = 1 * time.Second
 	}
 
+	allRecipients := append(broadcastList, groupRecipients...)
 	var disconnectedIDs []string
-	for _, s := range subs {
+
+	for _, s := range allRecipients {
 		result := s.Deliver(msg, handler, timeout, ackTimeout)
 		switch result {
 		case DeliverySuccess:
@@ -544,11 +751,9 @@ func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
 
 	// Prune disconnected subscribers from topic
 	if len(disconnectedIDs) > 0 {
-		t.mu.Lock()
 		for _, id := range disconnectedIDs {
-			delete(t.subscribers, id)
+			_ = m.RemoveSubscriber(topicName, id)
 		}
-		t.mu.Unlock()
 	}
 
 	return seq, nil
@@ -633,7 +838,7 @@ func (m *Manager) scanInFlightRetries(
 	}
 }
 
-// Subscribe is a convenience method for registering a subscriber with a given ID.
+// Subscribe is a convenience method for registering a subscriber with a given ID and group.
 func (m *Manager) Subscribe(ctx context.Context, topicName, groupID, subscriberID string) (<-chan *Message, context.CancelFunc, error) {
 	bufSize := m.cfg.SubscriberBufferSize
 	if bufSize <= 0 {
@@ -641,6 +846,7 @@ func (m *Manager) Subscribe(ctx context.Context, topicName, groupID, subscriberI
 	}
 
 	sub := NewSubscriber(subscriberID, bufSize)
+	sub.GroupID = groupID
 	if ctx != nil {
 		go func() {
 			select {

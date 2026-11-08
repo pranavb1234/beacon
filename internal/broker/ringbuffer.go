@@ -107,3 +107,4 @@ func (rb *RingBuffer) GetFrom(seq uint64) ([]*Message, bool) {
 
 	return results, true
 }
+

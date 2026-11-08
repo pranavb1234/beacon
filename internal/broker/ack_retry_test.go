@@ -217,3 +217,4 @@ func TestAckRetry_ConcurrentAcks(t *testing.T) {
 	assert.Equal(t, uint64(msgCount), atomic.LoadUint64(&acksRecorded))
 	assert.Equal(t, 0, sub.InFlightCount())
 }
+

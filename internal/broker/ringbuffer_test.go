@@ -159,3 +159,4 @@ func TestRingBuffer_ConcurrentAppendRead(t *testing.T) {
 	assert.Greater(t, rb.NewestSeq(), uint64(0))
 	assert.Greater(t, rb.OldestSeq(), uint64(0))
 }
+

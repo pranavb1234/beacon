@@ -78,6 +78,26 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.Broker_SubscribeS
 		return status.Error(codes.InvalidArgument, "topic is required")
 	}
 
+	fromSeq := req.GetFromSeq()
+	group := req.GetGroup()
+
+	t := s.manager.GetOrCreateTopic(topic)
+
+	// If consumer group member with from_seq = 0, start from group committed offset + 1
+	if group != "" && fromSeq == 0 {
+		fromSeq = s.manager.GetGroupCommittedOffset(topic, group) + 1
+	}
+
+	// If from_seq is older than oldest available in the buffer, return OUT_OF_RANGE error
+	if fromSeq > 0 && t.RingBuffer().Len() > 0 {
+		oldest := t.RingBuffer().OldestSeq()
+		if fromSeq < oldest {
+			return status.Errorf(codes.OutOfRange,
+				"requested sequence %d is older than oldest available sequence %d",
+				fromSeq, oldest)
+		}
+	}
+
 	subID := req.GetSubscriberId()
 	if subID == "" {
 		subID = fmt.Sprintf("sub-%d", time.Now().UnixNano())
@@ -89,16 +109,46 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.Broker_SubscribeS
 	}
 
 	sub := NewSubscriber(subID, bufSize)
-	if err := s.manager.AddSubscriber(topic, sub); err != nil {
-		s.logger.Error("failed to add subscriber", "topic", topic, "subscriber_id", subID, "err", err)
-		return status.Errorf(codes.Internal, "add subscriber error: %v", err)
+	sub.GroupID = group
+
+	var replayMsgs []*pb.Message
+	var boundarySeq uint64
+
+	// Boundary synchronization:
+	// Acquire topic lock to snapshot boundarySeq and register the subscriber atomically.
+	// This prevents race conditions between ring buffer replay and incoming live publishes.
+	t.mu.Lock()
+	boundarySeq = t.RingBuffer().NewestSeq()
+	if fromSeq > 0 && fromSeq <= boundarySeq {
+		rawMsgs, ok := t.RingBuffer().GetFrom(fromSeq)
+		if !ok {
+			t.mu.Unlock()
+			return status.Errorf(codes.OutOfRange,
+				"requested sequence %d is older than oldest available sequence %d",
+				fromSeq, t.RingBuffer().OldestSeq())
+		}
+		for _, m := range rawMsgs {
+			if m.Seq <= boundarySeq {
+				replayMsgs = append(replayMsgs, &pb.Message{
+					Topic:       m.Topic,
+					Seq:         m.Seq,
+					Payload:     m.Payload,
+					TimestampNs: m.TimestampNS,
+				})
+			}
+		}
 	}
+	t.AddSubscriberLocked(sub)
+	t.mu.Unlock()
+
+	s.manager.startRetryScanner(sub)
 
 	s.logger.Info("subscriber connected",
 		"topic", topic,
 		"subscriber_id", subID,
-		"group", req.GetGroup(),
-		"from_seq", req.GetFromSeq(),
+		"group", group,
+		"from_seq", fromSeq,
+		"replay_count", len(replayMsgs),
 	)
 
 	defer func() {
@@ -109,6 +159,14 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.Broker_SubscribeS
 		)
 	}()
 
+	// 1. Stream replayed messages first
+	for _, m := range replayMsgs {
+		if err := stream.Send(m); err != nil {
+			return err
+		}
+	}
+
+	// 2. Stream live messages, skipping any messages already replayed
 	for {
 		select {
 		case <-stream.Context().Done():
@@ -126,6 +184,11 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.Broker_SubscribeS
 					return status.Errorf(codes.ResourceExhausted, "subscriber channel closed: %v", err)
 				}
 				return nil
+			}
+
+			// Boundary check: skip live message if it was already sent during replay
+			if msg.Seq <= boundarySeq {
+				continue
 			}
 
 			pbMsg := &pb.Message{

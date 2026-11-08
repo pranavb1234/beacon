@@ -3,6 +3,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -49,19 +50,25 @@ func (d *Deduplicator) HighestSeq(topic string) uint64 {
 	return d.highest[topic]
 }
 
-// Subscriber is an SDK subscriber that handles streaming, deduplication, and automatic ACKs.
+// Subscriber is an SDK subscriber that handles streaming, deduplication, automatic ACKs,
+// and seamless auto-reconnect from last processed sequence.
 type Subscriber struct {
 	client       pb.BrokerClient
 	subscriberID string
 	dedup        *Deduplicator
+
+	InitialBackoff time.Duration
+	MaxBackoff     time.Duration
 }
 
 // NewSubscriber creates a new SDK Subscriber.
 func NewSubscriber(client pb.BrokerClient, subscriberID string) *Subscriber {
 	return &Subscriber{
-		client:       client,
-		subscriberID: subscriberID,
-		dedup:        NewDeduplicator(),
+		client:         client,
+		subscriberID:   subscriberID,
+		dedup:          NewDeduplicator(),
+		InitialBackoff: 50 * time.Millisecond,
+		MaxBackoff:     2 * time.Second,
 	}
 }
 
@@ -70,10 +77,51 @@ func (s *Subscriber) Deduplicator() *Deduplicator {
 	return s.dedup
 }
 
-// Consume subscribes to a topic and processes incoming messages.
-// It de-duplicates by remembering the highest contiguous sequence processed per topic,
-// ignores redeliveries for processing, and always sends an ACK for duplicates so the broker stops retrying.
+// Consume starts consuming messages from topic. If the stream disconnects unexpectedly,
+// it automatically reconnects with from_seq = last_processed_seq + 1 using exponential backoff.
 func (s *Subscriber) Consume(ctx context.Context, topic, group string, fromSeq uint64, handler MessageHandler) error {
+	backoff := s.InitialBackoff
+	if backoff <= 0 {
+		backoff = 50 * time.Millisecond
+	}
+	maxBackoff := s.MaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = 2 * time.Second
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Calculate resume sequence: if we've processed messages, resume at highest + 1
+		reqFromSeq := fromSeq
+		highest := s.dedup.HighestSeq(topic)
+		if highest > 0 {
+			reqFromSeq = highest + 1
+		}
+
+		err := s.streamOnce(ctx, topic, group, reqFromSeq, handler)
+		if err == nil || errors.Is(err, io.EOF) || errors.Is(ctx.Err(), context.Canceled) {
+			return nil
+		}
+
+		// Exponential backoff before reconnecting
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+func (s *Subscriber) streamOnce(ctx context.Context, topic, group string, fromSeq uint64, handler MessageHandler) error {
 	stream, err := s.client.Subscribe(ctx, &pb.SubscribeRequest{
 		Topic:        topic,
 		Group:        group,
@@ -87,26 +135,21 @@ func (s *Subscriber) Consume(ctx context.Context, topic, group string, fromSeq u
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
-			if err == io.EOF || ctx.Err() != nil {
-				return nil
-			}
 			return err
 		}
 
-		// Check if message is a redelivered duplicate
+		// Check deduplication
 		if s.dedup.IsDuplicate(msg.GetTopic(), msg.GetSeq()) {
-			// Always ACK duplicate so the broker clears in-flight state and stops retrying
 			s.ack(ctx, msg.GetTopic(), group, msg.GetSeq())
 			continue
 		}
 
-		// Dispatch new message to handler
+		// Dispatch to user handler
 		if err := handler(msg); err != nil {
-			// If handler failed, do not ACK so message will be redelivered
 			continue
 		}
 
-		// Processed successfully: send ACK
+		// ACK processed message
 		s.ack(ctx, msg.GetTopic(), group, msg.GetSeq())
 	}
 }
