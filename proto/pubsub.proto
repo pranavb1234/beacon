@@ -20,6 +20,13 @@ service Broker {
 service Internal {
   // Heartbeat is sent periodically between cluster peer brokers to monitor liveness.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Forward proxies a Publish call from a non-owner node to the topic's owner node.
+  rpc Forward(ForwardPublishRequest) returns (PublishResponse);
+
+  // ForwardSubscribe proxies a Subscribe stream from a non-owner node to the topic's owner,
+  // then streams messages back through the forwarding node to the original client.
+  rpc ForwardSubscribe(SubscribeRequest) returns (stream Message);
 }
 
 // PublishRequest contains the message payload to be published to a specific topic.
@@ -84,6 +91,18 @@ message AckRequest {
 
 // AckResponse is an empty confirmation acknowledging message processing.
 message AckResponse {}
+
+// ForwardPublishRequest wraps a PublishRequest with routing metadata for inter-broker forwarding.
+message ForwardPublishRequest {
+  // request is the original client publish request being forwarded.
+  PublishRequest request = 1;
+
+  // hop_count is incremented on each forward hop; rejected if > 1 to prevent forwarding loops.
+  int32 hop_count = 2;
+
+  // source_node_id is the ID of the forwarding node (for logging and loop detection).
+  string source_node_id = 3;
+}
 
 // HeartbeatRequest contains peer node liveness and epoch information.
 message HeartbeatRequest {

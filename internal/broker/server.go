@@ -25,6 +25,10 @@ type Server struct {
 	logger     *slog.Logger
 	grpcServer *grpc.Server
 
+	// router, when set, intercepts Publish/Subscribe/Ack and routes them to
+	// the topic's owner node. Set via AttachRouter after construction.
+	router *Router
+
 	mu       sync.Mutex
 	listener net.Listener
 }
@@ -50,6 +54,16 @@ func NewServer(manager *Manager, cfg *config.Config, logger *slog.Logger) *Serve
 	return s
 }
 
+// AttachRouter wires a Router into the server so that Publish, Subscribe, and Ack
+// RPCs are routed to the topic's consistent-hash owner rather than always handled locally.
+// Also registers the router as the InternalServer (Forward / ForwardSubscribe handler).
+func (s *Server) AttachRouter(r *Router) {
+	s.mu.Lock()
+	s.router = r
+	s.mu.Unlock()
+	pb.RegisterInternalServer(s.grpcServer, r)
+}
+
 // RegisterInternalServer registers an implementation of the cluster Internal gRPC service.
 func (s *Server) RegisterInternalServer(srv pb.InternalServer) {
 	pb.RegisterInternalServer(s.grpcServer, srv)
@@ -57,6 +71,19 @@ func (s *Server) RegisterInternalServer(srv pb.InternalServer) {
 
 // Publish receives a message payload and publishes it via Manager.
 func (s *Server) Publish(ctx context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
+	s.mu.Lock()
+	r := s.router
+	s.mu.Unlock()
+
+	if r != nil {
+		return r.RoutePublish(ctx, req)
+	}
+
+	return s.publishLocal(ctx, req)
+}
+
+// publishLocal publishes directly on this node's manager without routing.
+func (s *Server) publishLocal(ctx context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
 	if req.GetTopic() == "" {
 		return nil, status.Error(codes.InvalidArgument, "topic is required")
 	}
@@ -78,6 +105,19 @@ func (s *Server) Publish(ctx context.Context, req *pb.PublishRequest) (*pb.Publi
 
 // Subscribe opens a server-streaming connection to stream topic messages to the client.
 func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.Broker_SubscribeServer) error {
+	s.mu.Lock()
+	r := s.router
+	s.mu.Unlock()
+
+	if r != nil {
+		return r.RouteSubscribe(req, stream)
+	}
+
+	return s.subscribeLocal(req, stream)
+}
+
+// subscribeLocal handles a Subscribe RPC directly on this node's manager (no routing).
+func (s *Server) subscribeLocal(req *pb.SubscribeRequest, stream pb.Broker_SubscribeServer) error {
 	topic := req.GetTopic()
 	if topic == "" {
 		return status.Error(codes.InvalidArgument, "topic is required")
@@ -217,6 +257,19 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.Broker_SubscribeS
 
 // Ack accepts, logs, and processes message acknowledgments.
 func (s *Server) Ack(ctx context.Context, req *pb.AckRequest) (*pb.AckResponse, error) {
+	s.mu.Lock()
+	r := s.router
+	s.mu.Unlock()
+
+	if r != nil {
+		return r.RouteAck(ctx, req)
+	}
+
+	return s.ackLocal(ctx, req)
+}
+
+// ackLocal processes an Ack directly on this node's manager without routing.
+func (s *Server) ackLocal(ctx context.Context, req *pb.AckRequest) (*pb.AckResponse, error) {
 	s.logger.Info("received ack",
 		"topic", req.GetTopic(),
 		"subscriber_id", req.GetSubscriberId(),
@@ -225,6 +278,11 @@ func (s *Server) Ack(ctx context.Context, req *pb.AckRequest) (*pb.AckResponse, 
 	)
 	s.manager.Acknowledge(req.GetTopic(), req.GetSubscriberId(), req.GetSeq())
 	return &pb.AckResponse{}, nil
+}
+
+// GRPCServer returns the underlying gRPC server (for registering additional services).
+func (s *Server) GRPCServer() *grpc.Server {
+	return s.grpcServer
 }
 
 // Serve accepts incoming connections on the listener.

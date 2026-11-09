@@ -224,7 +224,9 @@ var Broker_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	Internal_Heartbeat_FullMethodName = "/pubsub.v1.Internal/Heartbeat"
+	Internal_Heartbeat_FullMethodName        = "/pubsub.v1.Internal/Heartbeat"
+	Internal_Forward_FullMethodName          = "/pubsub.v1.Internal/Forward"
+	Internal_ForwardSubscribe_FullMethodName = "/pubsub.v1.Internal/ForwardSubscribe"
 )
 
 // InternalClient is the client API for Internal service.
@@ -235,6 +237,11 @@ const (
 type InternalClient interface {
 	// Heartbeat is sent periodically between cluster peer brokers to monitor liveness.
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
+	// Forward proxies a Publish call from a non-owner node to the topic's owner node.
+	Forward(ctx context.Context, in *ForwardPublishRequest, opts ...grpc.CallOption) (*PublishResponse, error)
+	// ForwardSubscribe proxies a Subscribe stream from a non-owner node to the topic's owner,
+	// then streams messages back through the forwarding node to the original client.
+	ForwardSubscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (Internal_ForwardSubscribeClient, error)
 }
 
 type internalClient struct {
@@ -255,6 +262,49 @@ func (c *internalClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, op
 	return out, nil
 }
 
+func (c *internalClient) Forward(ctx context.Context, in *ForwardPublishRequest, opts ...grpc.CallOption) (*PublishResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PublishResponse)
+	err := c.cc.Invoke(ctx, Internal_Forward_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) ForwardSubscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (Internal_ForwardSubscribeClient, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Internal_ServiceDesc.Streams[0], Internal_ForwardSubscribe_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &internalForwardSubscribeClient{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type Internal_ForwardSubscribeClient interface {
+	Recv() (*Message, error)
+	grpc.ClientStream
+}
+
+type internalForwardSubscribeClient struct {
+	grpc.ClientStream
+}
+
+func (x *internalForwardSubscribeClient) Recv() (*Message, error) {
+	m := new(Message)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // InternalServer is the server API for Internal service.
 // All implementations must embed UnimplementedInternalServer
 // for forward compatibility
@@ -263,6 +313,11 @@ func (c *internalClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, op
 type InternalServer interface {
 	// Heartbeat is sent periodically between cluster peer brokers to monitor liveness.
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
+	// Forward proxies a Publish call from a non-owner node to the topic's owner node.
+	Forward(context.Context, *ForwardPublishRequest) (*PublishResponse, error)
+	// ForwardSubscribe proxies a Subscribe stream from a non-owner node to the topic's owner,
+	// then streams messages back through the forwarding node to the original client.
+	ForwardSubscribe(*SubscribeRequest, Internal_ForwardSubscribeServer) error
 	mustEmbedUnimplementedInternalServer()
 }
 
@@ -272,6 +327,12 @@ type UnimplementedInternalServer struct {
 
 func (UnimplementedInternalServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Heartbeat not implemented")
+}
+func (UnimplementedInternalServer) Forward(context.Context, *ForwardPublishRequest) (*PublishResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Forward not implemented")
+}
+func (UnimplementedInternalServer) ForwardSubscribe(*SubscribeRequest, Internal_ForwardSubscribeServer) error {
+	return status.Errorf(codes.Unimplemented, "method ForwardSubscribe not implemented")
 }
 func (UnimplementedInternalServer) mustEmbedUnimplementedInternalServer() {}
 
@@ -304,6 +365,45 @@ func _Internal_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Internal_Forward_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForwardPublishRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).Forward(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_Forward_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).Forward(ctx, req.(*ForwardPublishRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_ForwardSubscribe_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SubscribeRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(InternalServer).ForwardSubscribe(m, &internalForwardSubscribeServer{ServerStream: stream})
+}
+
+type Internal_ForwardSubscribeServer interface {
+	Send(*Message) error
+	grpc.ServerStream
+}
+
+type internalForwardSubscribeServer struct {
+	grpc.ServerStream
+}
+
+func (x *internalForwardSubscribeServer) Send(m *Message) error {
+	return x.ServerStream.SendMsg(m)
+}
+
 // Internal_ServiceDesc is the grpc.ServiceDesc for Internal service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -315,7 +415,17 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Heartbeat",
 			Handler:    _Internal_Heartbeat_Handler,
 		},
+		{
+			MethodName: "Forward",
+			Handler:    _Internal_Forward_Handler,
+		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "ForwardSubscribe",
+			Handler:       _Internal_ForwardSubscribe_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "pubsub.proto",
 }
