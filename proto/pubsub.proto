@@ -27,6 +27,15 @@ service Internal {
   // ForwardSubscribe proxies a Subscribe stream from a non-owner node to the topic's owner,
   // then streams messages back through the forwarding node to the original client.
   rpc ForwardSubscribe(SubscribeRequest) returns (stream Message);
+
+  // Replicate streams published messages and offset commits from the topic owner to the replica.
+  rpc Replicate(stream ReplicateMsg) returns (stream ReplicateAck);
+
+  // SyncTopic streams historical ring buffer messages from owner to a newly assigned or catching-up replica.
+  rpc SyncTopic(SyncRequest) returns (stream ReplicateMsg);
+
+  // Handoff coordinates ownership transfer of a topic from current owner to a synced returning node.
+  rpc Handoff(HandoffRequest) returns (HandoffResponse);
 }
 
 // PublishRequest contains the message payload to be published to a specific topic.
@@ -36,6 +45,12 @@ message PublishRequest {
 
   // payload is the raw binary content of the message.
   bytes payload = 2;
+
+  // client_id identifies the publishing client instance (for deduplication / idempotency).
+  string client_id = 3;
+
+  // client_seq is the monotonic per-client publication sequence number.
+  uint64 client_seq = 4;
 }
 
 // PublishResponse acknowledges message publication with its assigned monotonic sequence number.
@@ -124,4 +139,80 @@ message HeartbeatResponse {
   // ok indicates whether the heartbeat was accepted.
   bool ok = 2;
 }
+
+// ReplicateMsg carries live published messages or consumer group offset updates from owner to replica.
+message ReplicateMsg {
+  // topic is the topic name being replicated.
+  string topic = 1;
+
+  // epoch is the term/epoch of the sending owner.
+  uint64 epoch = 2;
+
+  // seq is the message sequence number.
+  uint64 seq = 3;
+
+  // payload is the raw payload of the published message.
+  bytes payload = 4;
+
+  // timestamp_ns is the original publication timestamp.
+  int64 timestamp_ns = 5;
+
+  // group is the consumer group ID if this message replicates a committed offset update.
+  string group = 6;
+
+  // committed_offset is the highest contiguous acked sequence for the consumer group.
+  uint64 committed_offset = 7;
+
+  // is_offset_commit indicates whether this message is an offset commit replication rather than a data message.
+  bool is_offset_commit = 8;
+}
+
+// ReplicateAck acknowledges receipt and persistence of a replicated message or offset by the replica.
+message ReplicateAck {
+  // topic is the topic name.
+  string topic = 1;
+
+  // seq is the sequence number acknowledged.
+  uint64 seq = 2;
+
+  // epoch is the replica's known epoch.
+  uint64 epoch = 3;
+
+  // ok indicates whether the replica accepted the message (rejected if epoch is stale).
+  bool ok = 4;
+}
+
+// SyncRequest is sent by a replica or recovering node to catch up from a given sequence number.
+message SyncRequest {
+  // topic is the topic to synchronize.
+  string topic = 1;
+
+  // from_seq is the sequence number to start replaying from (inclusive).
+  uint64 from_seq = 2;
+
+  // epoch is the caller's current epoch.
+  uint64 epoch = 3;
+}
+
+// HandoffRequest requests graceful ownership transfer from current owner to returning node.
+message HandoffRequest {
+  // topic is the topic being transferred.
+  string topic = 1;
+
+  // new_owner_id is the node ID taking over ownership.
+  string new_owner_id = 2;
+
+  // epoch is the new higher epoch to transition into.
+  uint64 epoch = 3;
+}
+
+// HandoffResponse confirms ownership transfer.
+message HandoffResponse {
+  // ok indicates whether handoff succeeded.
+  bool ok = 1;
+
+  // epoch is the acknowledged epoch.
+  uint64 epoch = 2;
+}
+
 

@@ -52,6 +52,13 @@ type connEntry struct {
 	broker pb.BrokerClient // for Ack forwarding via the public Broker service
 }
 
+// InternalHandler defines the cluster replication and failover handler interface.
+type InternalHandler interface {
+	HandleReplicate(stream pb.Internal_ReplicateServer) error
+	SyncTopic(req *pb.SyncRequest, stream pb.Internal_SyncTopicServer) error
+	Handoff(ctx context.Context, req *pb.HandoffRequest) (*pb.HandoffResponse, error)
+}
+
 // Router routes Publish and Subscribe requests to the topic's owner node
 // according to the consistent hash ring, maintaining a connection pool of
 // reusable gRPC client connections.
@@ -80,6 +87,14 @@ type Router struct {
 
 	// customDialer is optional; set during tests to route via bufconn.
 	customDialer cluster.DialerFunc
+
+	// internalHandler manages replication and failover RPCs.
+	internalHandler InternalHandler
+}
+
+// AttachInternalHandler sets the cluster handler for Replicate, SyncTopic, and Handoff RPCs.
+func (r *Router) AttachInternalHandler(h InternalHandler) {
+	r.internalHandler = h
 }
 
 // RouterOption configures a Router.
@@ -349,6 +364,30 @@ func (r *Router) ForwardSubscribe(req *pb.SubscribeRequest, stream pb.Internal_F
 	// Wrap the internal stream as a Broker_SubscribeServer so we can call localServer.Subscribe.
 	proxy := &internalSubscribeProxy{stream: stream}
 	return r.localServer.subscribeLocal(req, proxy)
+}
+
+// Replicate handles incoming Replicate streams by delegating to internalHandler.
+func (r *Router) Replicate(stream pb.Internal_ReplicateServer) error {
+	if r.internalHandler != nil {
+		return r.internalHandler.HandleReplicate(stream)
+	}
+	return status.Errorf(codes.Unimplemented, "Replicate not handled on router")
+}
+
+// SyncTopic handles catch-up replay streams by delegating to internalHandler.
+func (r *Router) SyncTopic(req *pb.SyncRequest, stream pb.Internal_SyncTopicServer) error {
+	if r.internalHandler != nil {
+		return r.internalHandler.SyncTopic(req, stream)
+	}
+	return status.Errorf(codes.Unimplemented, "SyncTopic not handled on router")
+}
+
+// Handoff coordinates graceful ownership transfer by delegating to internalHandler.
+func (r *Router) Handoff(ctx context.Context, req *pb.HandoffRequest) (*pb.HandoffResponse, error) {
+	if r.internalHandler != nil {
+		return r.internalHandler.Handoff(ctx, req)
+	}
+	return nil, status.Errorf(codes.Unimplemented, "Handoff not handled on router")
 }
 
 // internalSubscribeProxy adapts an Internal_ForwardSubscribeServer to the

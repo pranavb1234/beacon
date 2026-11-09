@@ -227,6 +227,9 @@ const (
 	Internal_Heartbeat_FullMethodName        = "/pubsub.v1.Internal/Heartbeat"
 	Internal_Forward_FullMethodName          = "/pubsub.v1.Internal/Forward"
 	Internal_ForwardSubscribe_FullMethodName = "/pubsub.v1.Internal/ForwardSubscribe"
+	Internal_Replicate_FullMethodName        = "/pubsub.v1.Internal/Replicate"
+	Internal_SyncTopic_FullMethodName        = "/pubsub.v1.Internal/SyncTopic"
+	Internal_Handoff_FullMethodName          = "/pubsub.v1.Internal/Handoff"
 )
 
 // InternalClient is the client API for Internal service.
@@ -242,6 +245,12 @@ type InternalClient interface {
 	// ForwardSubscribe proxies a Subscribe stream from a non-owner node to the topic's owner,
 	// then streams messages back through the forwarding node to the original client.
 	ForwardSubscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (Internal_ForwardSubscribeClient, error)
+	// Replicate streams published messages and offset commits from the topic owner to the replica.
+	Replicate(ctx context.Context, opts ...grpc.CallOption) (Internal_ReplicateClient, error)
+	// SyncTopic streams historical ring buffer messages from owner to a newly assigned or catching-up replica.
+	SyncTopic(ctx context.Context, in *SyncRequest, opts ...grpc.CallOption) (Internal_SyncTopicClient, error)
+	// Handoff coordinates ownership transfer of a topic from current owner to a synced returning node.
+	Handoff(ctx context.Context, in *HandoffRequest, opts ...grpc.CallOption) (*HandoffResponse, error)
 }
 
 type internalClient struct {
@@ -305,6 +314,81 @@ func (x *internalForwardSubscribeClient) Recv() (*Message, error) {
 	return m, nil
 }
 
+func (c *internalClient) Replicate(ctx context.Context, opts ...grpc.CallOption) (Internal_ReplicateClient, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Internal_ServiceDesc.Streams[1], Internal_Replicate_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &internalReplicateClient{ClientStream: stream}
+	return x, nil
+}
+
+type Internal_ReplicateClient interface {
+	Send(*ReplicateMsg) error
+	Recv() (*ReplicateAck, error)
+	grpc.ClientStream
+}
+
+type internalReplicateClient struct {
+	grpc.ClientStream
+}
+
+func (x *internalReplicateClient) Send(m *ReplicateMsg) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *internalReplicateClient) Recv() (*ReplicateAck, error) {
+	m := new(ReplicateAck)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *internalClient) SyncTopic(ctx context.Context, in *SyncRequest, opts ...grpc.CallOption) (Internal_SyncTopicClient, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Internal_ServiceDesc.Streams[2], Internal_SyncTopic_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &internalSyncTopicClient{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type Internal_SyncTopicClient interface {
+	Recv() (*ReplicateMsg, error)
+	grpc.ClientStream
+}
+
+type internalSyncTopicClient struct {
+	grpc.ClientStream
+}
+
+func (x *internalSyncTopicClient) Recv() (*ReplicateMsg, error) {
+	m := new(ReplicateMsg)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *internalClient) Handoff(ctx context.Context, in *HandoffRequest, opts ...grpc.CallOption) (*HandoffResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffResponse)
+	err := c.cc.Invoke(ctx, Internal_Handoff_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InternalServer is the server API for Internal service.
 // All implementations must embed UnimplementedInternalServer
 // for forward compatibility
@@ -318,6 +402,12 @@ type InternalServer interface {
 	// ForwardSubscribe proxies a Subscribe stream from a non-owner node to the topic's owner,
 	// then streams messages back through the forwarding node to the original client.
 	ForwardSubscribe(*SubscribeRequest, Internal_ForwardSubscribeServer) error
+	// Replicate streams published messages and offset commits from the topic owner to the replica.
+	Replicate(Internal_ReplicateServer) error
+	// SyncTopic streams historical ring buffer messages from owner to a newly assigned or catching-up replica.
+	SyncTopic(*SyncRequest, Internal_SyncTopicServer) error
+	// Handoff coordinates ownership transfer of a topic from current owner to a synced returning node.
+	Handoff(context.Context, *HandoffRequest) (*HandoffResponse, error)
 	mustEmbedUnimplementedInternalServer()
 }
 
@@ -333,6 +423,15 @@ func (UnimplementedInternalServer) Forward(context.Context, *ForwardPublishReque
 }
 func (UnimplementedInternalServer) ForwardSubscribe(*SubscribeRequest, Internal_ForwardSubscribeServer) error {
 	return status.Errorf(codes.Unimplemented, "method ForwardSubscribe not implemented")
+}
+func (UnimplementedInternalServer) Replicate(Internal_ReplicateServer) error {
+	return status.Errorf(codes.Unimplemented, "method Replicate not implemented")
+}
+func (UnimplementedInternalServer) SyncTopic(*SyncRequest, Internal_SyncTopicServer) error {
+	return status.Errorf(codes.Unimplemented, "method SyncTopic not implemented")
+}
+func (UnimplementedInternalServer) Handoff(context.Context, *HandoffRequest) (*HandoffResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Handoff not implemented")
 }
 func (UnimplementedInternalServer) mustEmbedUnimplementedInternalServer() {}
 
@@ -404,6 +503,71 @@ func (x *internalForwardSubscribeServer) Send(m *Message) error {
 	return x.ServerStream.SendMsg(m)
 }
 
+func _Internal_Replicate_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(InternalServer).Replicate(&internalReplicateServer{ServerStream: stream})
+}
+
+type Internal_ReplicateServer interface {
+	Send(*ReplicateAck) error
+	Recv() (*ReplicateMsg, error)
+	grpc.ServerStream
+}
+
+type internalReplicateServer struct {
+	grpc.ServerStream
+}
+
+func (x *internalReplicateServer) Send(m *ReplicateAck) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *internalReplicateServer) Recv() (*ReplicateMsg, error) {
+	m := new(ReplicateMsg)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func _Internal_SyncTopic_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SyncRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(InternalServer).SyncTopic(m, &internalSyncTopicServer{ServerStream: stream})
+}
+
+type Internal_SyncTopicServer interface {
+	Send(*ReplicateMsg) error
+	grpc.ServerStream
+}
+
+type internalSyncTopicServer struct {
+	grpc.ServerStream
+}
+
+func (x *internalSyncTopicServer) Send(m *ReplicateMsg) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func _Internal_Handoff_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).Handoff(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_Handoff_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).Handoff(ctx, req.(*HandoffRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Internal_ServiceDesc is the grpc.ServiceDesc for Internal service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -419,11 +583,26 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Forward",
 			Handler:    _Internal_Forward_Handler,
 		},
+		{
+			MethodName: "Handoff",
+			Handler:    _Internal_Handoff_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "ForwardSubscribe",
 			Handler:       _Internal_ForwardSubscribe_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "Replicate",
+			Handler:       _Internal_Replicate_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "SyncTopic",
+			Handler:       _Internal_SyncTopic_Handler,
 			ServerStreams: true,
 		},
 	},

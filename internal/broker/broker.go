@@ -408,15 +408,108 @@ func (cg *ConsumerGroup) Acknowledge(seq uint64) uint64 {
 	return cg.committedOffset
 }
 
+// SetCommittedOffset overrides the committed offset if higher than current.
+func (cg *ConsumerGroup) SetCommittedOffset(offset uint64) {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+	if offset > cg.committedOffset {
+		cg.committedOffset = offset
+	}
+}
+
+// IdempotencyKey identifies a client publication attempt.
+type idempotencyKey struct {
+	clientID  string
+	clientSeq uint64
+}
+
+// IdempotencyLRU stores recent publication deduplication entries in a bounded LRU.
+type IdempotencyLRU struct {
+	mu       sync.Mutex
+	capacity int
+	entries  map[idempotencyKey]uint64
+	order    []idempotencyKey
+}
+
+// NewIdempotencyLRU creates a bounded LRU cache for deduplicating retried publishes.
+func NewIdempotencyLRU(capacity int) *IdempotencyLRU {
+	if capacity <= 0 {
+		capacity = 1000
+	}
+	return &IdempotencyLRU{
+		capacity: capacity,
+		entries:  make(map[idempotencyKey]uint64),
+		order:    make([]idempotencyKey, 0, capacity),
+	}
+}
+
+// Get checks if a client's sequence was already assigned a sequence number.
+func (l *IdempotencyLRU) Get(clientID string, clientSeq uint64) (uint64, bool) {
+	if clientID == "" || clientSeq == 0 {
+		return 0, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	k := idempotencyKey{clientID: clientID, clientSeq: clientSeq}
+	seq, ok := l.entries[k]
+	return seq, ok
+}
+
+// Put records the assigned sequence for a client's publish sequence.
+func (l *IdempotencyLRU) Put(clientID string, clientSeq, assignedSeq uint64) {
+	if clientID == "" || clientSeq == 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	k := idempotencyKey{clientID: clientID, clientSeq: clientSeq}
+	if _, ok := l.entries[k]; ok {
+		return
+	}
+	if len(l.order) >= l.capacity {
+		oldest := l.order[0]
+		l.order = l.order[1:]
+		delete(l.entries, oldest)
+	}
+	l.entries[k] = assignedSeq
+	l.order = append(l.order, k)
+}
+
 // Topic holds state for a single topic, including ring buffer, subscribers, and consumer groups.
 type Topic struct {
 	Name          string
 	nextSeq       uint64
+	epoch         uint64
+	idempotency   *IdempotencyLRU
 	subscribers   map[string]*Subscriber
 	broadcastSubs map[string]*Subscriber
 	groups        map[string]*ConsumerGroup
 	ringBuffer    *RingBuffer
 	mu            sync.RWMutex
+}
+
+// Epoch returns the current term/epoch of the topic.
+func (t *Topic) Epoch() uint64 {
+	e := atomic.LoadUint64(&t.epoch)
+	if e == 0 {
+		return 1
+	}
+	return e
+}
+
+// SetEpoch sets the topic epoch.
+func (t *Topic) SetEpoch(epoch uint64) {
+	atomic.StoreUint64(&t.epoch, epoch)
+}
+
+// IncrementEpoch increments the topic epoch and returns the new value.
+func (t *Topic) IncrementEpoch() uint64 {
+	return atomic.AddUint64(&t.epoch, 1)
+}
+
+// SetNextSeq updates the topic's next sequence counter.
+func (t *Topic) SetNextSeq(seq uint64) {
+	atomic.StoreUint64(&t.nextSeq, seq)
 }
 
 // RingBuffer returns the ring buffer storing recent messages for this topic.
@@ -524,6 +617,8 @@ func (m *Manager) GetOrCreateTopic(name string) *Topic {
 
 	t := &Topic{
 		Name:          name,
+		epoch:         1,
+		idempotency:   NewIdempotencyLRU(1000),
 		subscribers:   make(map[string]*Subscriber),
 		broadcastSubs: make(map[string]*Subscriber),
 		groups:        make(map[string]*ConsumerGroup),
@@ -531,6 +626,25 @@ func (m *Manager) GetOrCreateTopic(name string) *Topic {
 	}
 	m.topics[name] = t
 	return t
+}
+
+// GetTopic returns the *Topic if it exists, without creating it.
+func (m *Manager) GetTopic(name string) (*Topic, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	t, ok := m.topics[name]
+	return t, ok
+}
+
+// Topics returns all topics currently registered with the manager.
+func (m *Manager) Topics() []*Topic {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	res := make([]*Topic, 0, len(m.topics))
+	for _, t := range m.topics {
+		res = append(res, t)
+	}
+	return res
 }
 
 // getOrCreateTopic provides private compatibility.
@@ -690,13 +804,88 @@ func (m *Manager) GetGroupCommittedOffset(topicName, group string) uint64 {
 	return cg.CommittedOffset()
 }
 
+// SetGroupCommittedOffset sets the committed offset for a consumer group on this broker (used by replica sync).
+func (m *Manager) SetGroupCommittedOffset(topicName, group string, offset uint64) {
+	t := m.GetOrCreateTopic(topicName)
+	t.mu.Lock()
+	cg, exists := t.groups[group]
+	if !exists {
+		cg = NewConsumerGroup(group, topicName)
+		t.groups[group] = cg
+	}
+	t.mu.Unlock()
+	cg.SetCommittedOffset(offset)
+}
+
+// AppendReplicatedMessage stores a replicated message into the local ring buffer,
+// updates the sequence counter, and delivers to local subscribers.
+func (m *Manager) AppendReplicatedMessage(msg *Message) {
+	t := m.GetOrCreateTopic(msg.Topic)
+
+	// Ensure sequence number is at least msg.Seq
+	for {
+		curr := atomic.LoadUint64(&t.nextSeq)
+		if msg.Seq <= curr || atomic.CompareAndSwapUint64(&t.nextSeq, curr, msg.Seq) {
+			break
+		}
+	}
+
+	t.ringBuffer.Append(msg)
+
+	// Fan out to any local subscribers attached to this replica
+	t.mu.RLock()
+	broadcastList := make([]*Subscriber, 0, len(t.broadcastSubs))
+	for _, s := range t.broadcastSubs {
+		broadcastList = append(broadcastList, s)
+	}
+	groupRecipients := make([]*Subscriber, 0, len(t.groups))
+	for _, cg := range t.groups {
+		if member := cg.NextMember(); member != nil {
+			groupRecipients = append(groupRecipients, member)
+		}
+	}
+	t.mu.RUnlock()
+
+	allRecipients := append(broadcastList, groupRecipients...)
+	handler := PolicyHandler(m.cfg.BackpressurePolicy)
+	timeout := m.cfg.BlockTimeout
+	if timeout <= 0 {
+		timeout = 500 * time.Millisecond
+	}
+	ackTimeout := m.cfg.AckTimeout
+	if ackTimeout <= 0 {
+		ackTimeout = 1 * time.Second
+	}
+
+	for _, s := range allRecipients {
+		_ = s.Deliver(msg, handler, timeout, ackTimeout)
+	}
+}
+
 // Publish assigns the next sequence number, stores it in the ring buffer,
 // broadcasts to independent subscribers, and round-robins to one member per consumer group.
 func (m *Manager) Publish(topicName string, payload []byte) (uint64, error) {
+	return m.PublishWithIdempotency(topicName, payload, "", 0)
+}
+
+// PublishWithIdempotency assigns the next sequence number (or returns existing seq if retried),
+// stores it in the ring buffer, and fans out to subscribers.
+func (m *Manager) PublishWithIdempotency(topicName string, payload []byte, clientID string, clientSeq uint64) (uint64, error) {
 	t := m.GetOrCreateTopic(topicName)
+
+	// Idempotency check: if already processed, return existing assigned sequence
+	if clientID != "" && clientSeq > 0 {
+		if existingSeq, found := t.idempotency.Get(clientID, clientSeq); found {
+			return existingSeq, nil
+		}
+	}
 
 	seq := atomic.AddUint64(&t.nextSeq, 1)
 	atomic.AddUint64(&m.publishedCount, 1)
+
+	if clientID != "" && clientSeq > 0 {
+		t.idempotency.Put(clientID, clientSeq, seq)
+	}
 
 	msg := &Message{
 		Topic:       topicName,

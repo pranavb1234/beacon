@@ -98,3 +98,4 @@ echo ""
 echo "  Tear down the cluster:"
 echo "    docker compose -f deploy/docker-compose.yml down"
 echo "============================================================"
+

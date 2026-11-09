@@ -16,6 +16,12 @@ import (
 	"github.com/pranavb1234/beacon/internal/pb"
 )
 
+// TopicReplicator defines the interface for replicating published messages and offset commits.
+type TopicReplicator interface {
+	ReplicatePublish(ctx context.Context, topic string, seq uint64, payload []byte, timestampNS int64) error
+	ReplicateOffsetCommit(topic, group string, committedOffset uint64)
+}
+
 // Server implements the gRPC Broker service.
 type Server struct {
 	pb.UnimplementedBrokerServer
@@ -28,6 +34,9 @@ type Server struct {
 	// router, when set, intercepts Publish/Subscribe/Ack and routes them to
 	// the topic's owner node. Set via AttachRouter after construction.
 	router *Router
+
+	// replicator, when set, replicates published messages to backup nodes.
+	replicator TopicReplicator
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -52,6 +61,13 @@ func NewServer(manager *Manager, cfg *config.Config, logger *slog.Logger) *Serve
 
 	pb.RegisterBrokerServer(grpcServer, s)
 	return s
+}
+
+// AttachReplicator sets the replicator responsible for replicating published messages and offset commits.
+func (s *Server) AttachReplicator(rep TopicReplicator) {
+	s.mu.Lock()
+	s.replicator = rep
+	s.mu.Unlock()
 }
 
 // AttachRouter wires a Router into the server so that Publish, Subscribe, and Ack
@@ -88,10 +104,22 @@ func (s *Server) publishLocal(ctx context.Context, req *pb.PublishRequest) (*pb.
 		return nil, status.Error(codes.InvalidArgument, "topic is required")
 	}
 
-	seq, err := s.manager.Publish(req.GetTopic(), req.GetPayload())
+	seq, err := s.manager.PublishWithIdempotency(req.GetTopic(), req.GetPayload(), req.GetClientId(), req.GetClientSeq())
 	if err != nil {
 		s.logger.Error("failed to publish message", "topic", req.GetTopic(), "err", err)
 		return nil, status.Errorf(codes.Internal, "publish error: %v", err)
+	}
+
+	// Replicate to backup replica
+	s.mu.Lock()
+	rep := s.replicator
+	s.mu.Unlock()
+
+	if rep != nil {
+		if repErr := rep.ReplicatePublish(ctx, req.GetTopic(), seq, req.GetPayload(), time.Now().UnixNano()); repErr != nil {
+			s.logger.Warn("replication error for published message", "topic", req.GetTopic(), "seq", seq, "err", repErr)
+			return nil, repErr
+		}
 	}
 
 	s.logger.Debug("published message",
@@ -277,6 +305,16 @@ func (s *Server) ackLocal(ctx context.Context, req *pb.AckRequest) (*pb.AckRespo
 		"group", req.GetGroup(),
 	)
 	s.manager.Acknowledge(req.GetTopic(), req.GetSubscriberId(), req.GetSeq())
+
+	s.mu.Lock()
+	rep := s.replicator
+	s.mu.Unlock()
+
+	if rep != nil && req.GetGroup() != "" {
+		offset := s.manager.GetGroupCommittedOffset(req.GetTopic(), req.GetGroup())
+		rep.ReplicateOffsetCommit(req.GetTopic(), req.GetGroup(), offset)
+	}
+
 	return &pb.AckResponse{}, nil
 }
 
