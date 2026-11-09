@@ -16,6 +16,12 @@ service Broker {
   rpc Ack(AckRequest) returns (AckResponse);
 }
 
+// Internal provides cluster-internal RPCs for inter-broker coordination.
+service Internal {
+  // Heartbeat is sent periodically between cluster peer brokers to monitor liveness.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
 // PublishRequest contains the message payload to be published to a specific topic.
 message PublishRequest {
   // topic is the target topic name where the message will be published.
@@ -78,3 +84,25 @@ message AckRequest {
 
 // AckResponse is an empty confirmation acknowledging message processing.
 message AckResponse {}
+
+// HeartbeatRequest contains peer node liveness and epoch information.
+message HeartbeatRequest {
+  // node_id is the unique identifier of the sending broker.
+  string node_id = 1;
+
+  // epoch is the term/epoch counter of the sending broker.
+  uint64 epoch = 2;
+
+  // timestamp is the Unix timestamp (nanoseconds) when heartbeat was dispatched.
+  int64 timestamp = 3;
+}
+
+// HeartbeatResponse acknowledges receipt of a heartbeat.
+message HeartbeatResponse {
+  // node_id is the unique identifier of the responding broker.
+  string node_id = 1;
+
+  // ok indicates whether the heartbeat was accepted.
+  bool ok = 2;
+}
+

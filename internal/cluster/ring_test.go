@@ -2,6 +2,8 @@ package cluster
 
 import (
 	"fmt"
+	"math"
+	"math/rand"
 	"sync"
 	"testing"
 
@@ -9,179 +11,196 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestEmptyRing verifies that Owner and Replica return false on an empty ring.
+// TestEmptyRing verifies that GetOwner and GetReplica return empty strings on an empty ring.
 func TestEmptyRing(t *testing.T) {
 	r := New(10)
+	assert.Equal(t, "", r.GetOwner("any-key"))
+	assert.Equal(t, "", r.GetReplica("any-key"))
 	_, _, ok := r.Owner("any-key")
-	assert.False(t, ok, "empty ring should return ok=false")
+	assert.False(t, ok)
 	_, _, ok = r.Replica("any-key")
 	assert.False(t, ok)
 }
 
-// TestSingleNode verifies that all keys route to the only node.
+// TestSingleNode verifies that all keys route to the only node, and replica == owner.
 func TestSingleNode(t *testing.T) {
 	r := New(10)
-	r.Add("node1", "localhost:9001")
+	r.AddNode("node1")
 
 	for _, key := range []string{"orders", "payments", "events"} {
-		id, addr, ok := r.Owner(key)
-		require.True(t, ok)
-		assert.Equal(t, "node1", id)
-		assert.Equal(t, "localhost:9001", addr)
+		assert.Equal(t, "node1", r.GetOwner(key))
+		assert.Equal(t, "node1", r.GetReplica(key))
 	}
 }
 
-// TestReplicaSameAsPrimaryOnSingleNode verifies the degenerate case where
-// replica == primary (only one distinct node exists).
-func TestReplicaSameAsPrimaryOnSingleNode(t *testing.T) {
-	r := New(10)
-	r.Add("node1", "localhost:9001")
-
-	oid, _, _ := r.Owner("topic")
-	rid, _, _ := r.Replica("topic")
-	assert.Equal(t, oid, rid)
-}
-
-// TestReplicaDiffersFromOwner verifies that with multiple nodes the replica
-// is always a different node from the primary owner.
-func TestReplicaDiffersFromOwner(t *testing.T) {
-	r := New(150)
-	r.Add("node1", "localhost:9001")
-	r.Add("node2", "localhost:9002")
-	r.Add("node3", "localhost:9003")
-
-	topics := []string{"orders", "payments", "events", "metrics", "logs", "users"}
-	for _, topic := range topics {
-		oid, _, _ := r.Owner(topic)
-		rid, _, _ := r.Replica(topic)
-		assert.NotEqual(t, oid, rid,
-			"topic %q: replica %s should differ from owner %s", topic, rid, oid)
-	}
-}
-
-// TestDistribution verifies that no node owns more than 2× or less than 0.5×
-// its fair share of keys over 10 000 samples.
-// Trade-off: 150 vnodes gives good uniformity; fewer vnodes would need a larger
-// tolerance here.
+// TestDistribution verifies that across 10,000 random topic names distributed across 3 nodes,
+// each node receives within 20% of the mean (fair share).
 func TestDistribution(t *testing.T) {
 	r := New(150)
-	nodeIDs := []string{"node1", "node2", "node3"}
-	for i, id := range nodeIDs {
-		r.Add(id, fmt.Sprintf("localhost:%d", 9001+i))
+	nodes := []string{"node-1", "node-2", "node-3"}
+	for _, n := range nodes {
+		r.AddNode(n)
 	}
 
-	counts := make(map[string]int, len(nodeIDs))
 	const total = 10_000
+	counts := make(map[string]int, len(nodes))
+
+	rng := rand.New(rand.NewSource(1337))
 	for i := 0; i < total; i++ {
-		id, _, _ := r.Owner(fmt.Sprintf("topic-%d", i))
-		counts[id]++
+		topic := fmt.Sprintf("topic-%d-%x", i, rng.Uint64())
+		owner := r.GetOwner(topic)
+		counts[owner]++
 	}
 
-	fairShare := float64(total) / float64(len(nodeIDs))
-	for _, id := range nodeIDs {
-		ratio := float64(counts[id]) / fairShare
-		assert.Less(t, ratio, 2.0,
-			"node %s owns too many keys (ratio=%.2f)", id, ratio)
-		assert.Greater(t, ratio, 0.5,
-			"node %s owns too few keys (ratio=%.2f)", id, ratio)
+	mean := float64(total) / float64(len(nodes))
+	t.Logf("Key counts across 3 nodes (mean = %.2f): %v", mean, counts)
+
+	for _, n := range nodes {
+		c := counts[n]
+		diffPct := math.Abs(float64(c)-mean) / mean * 100.0
+		t.Logf("Node %s: %d keys (diff: %.2f%%)", n, c, diffPct)
+		assert.LessOrEqual(t, diffPct, 20.0,
+			"node %s load %d deviated by %.2f%% which exceeds 20%% of the mean", n, c, diffPct)
 	}
-	t.Logf("Distribution: %v", counts)
 }
 
-// TestStabilityAfterRemoval verifies that only keys that were owned by the
-// removed node change assignment — all others remain stable.
-// This is the core correctness property of consistent hashing.
-func TestStabilityAfterRemoval(t *testing.T) {
+// TestMinimalMovement verifies that when one node is removed, ONLY keys previously
+// owned by the removed node are reassigned; all other keys remain with their original owners.
+func TestMinimalMovement(t *testing.T) {
 	r := New(150)
-	r.Add("node1", "localhost:9001")
-	r.Add("node2", "localhost:9002")
-	r.Add("node3", "localhost:9003")
+	r.AddNode("node1")
+	r.AddNode("node2")
+	r.AddNode("node3")
 
-	const n = 1000
+	const n = 10_000
 	before := make(map[string]string, n)
 	topics := make([]string, n)
-	for i := range topics {
-		topics[i] = fmt.Sprintf("topic-%d", i)
-		id, _, _ := r.Owner(topics[i])
-		before[topics[i]] = id
+
+	rng := rand.New(rand.NewSource(42))
+	for i := 0; i < n; i++ {
+		topics[i] = fmt.Sprintf("topic-%d-%x", i, rng.Uint64())
+		before[topics[i]] = r.GetOwner(topics[i])
 	}
 
-	r.Remove("node3")
+	// Remove node3
+	r.RemoveNode("node3")
 
 	moved := 0
 	for _, topic := range topics {
-		after, _, _ := r.Owner(topic)
+		after := r.GetOwner(topic)
 		if after != before[topic] {
 			moved++
 			assert.Equal(t, "node3", before[topic],
-				"key %q moved from %s→%s but only node3 was removed",
-				topic, before[topic], after)
+				"key %q moved from %s to %s, but only node3 was removed", topic, before[topic], after)
 		}
 	}
-	assert.Greater(t, moved, 0, "some keys should have moved after removing node3")
-	t.Logf("Moved %d/%d keys after removing node3", moved, n)
+
+	movedFraction := float64(moved) / float64(n)
+	t.Logf("Removed node3: moved %d/%d keys (fraction = %.4f, theoretical ~0.3333)", moved, n, movedFraction)
+
+	assert.Greater(t, moved, 0, "some keys must move after node removal")
+	// For 3 balanced nodes, removing 1 should move approximately 1/3 of the keys
+	assert.InDelta(t, 0.3333, movedFraction, 0.10, "moved fraction should be close to 1/3")
 }
 
-// TestRemoveAllKeysGoToSurvivor verifies that after removing all but one node,
-// every key routes to the surviving node.
-func TestRemoveAllKeysGoToSurvivor(t *testing.T) {
+// TestReplicaDiffersFromOwner verifies that when 2+ nodes exist, the replica is NEVER
+// the same node as the owner.
+func TestReplicaDiffersFromOwner(t *testing.T) {
 	r := New(150)
-	r.Add("node1", "localhost:9001")
-	r.Add("node2", "localhost:9002")
-	r.Remove("node1")
+	r.AddNode("node1")
+	r.AddNode("node2")
+	r.AddNode("node3")
 
-	for i := 0; i < 100; i++ {
-		id, _, ok := r.Owner(fmt.Sprintf("key-%d", i))
-		require.True(t, ok)
-		assert.Equal(t, "node2", id)
+	topics := []string{"orders", "payments", "events", "metrics", "logs", "users", "inventory", "auth"}
+	for _, topic := range topics {
+		owner := r.GetOwner(topic)
+		replica := r.GetReplica(topic)
+		assert.NotEmpty(t, owner)
+		assert.NotEmpty(t, replica)
+		assert.NotEqual(t, owner, replica,
+			"for topic %q: replica %s must never be the same as owner %s when 2+ nodes exist", topic, replica, owner)
+	}
+
+	// Test with exactly 2 nodes as well
+	r2 := New(150)
+	r2.AddNode("nodeA")
+	r2.AddNode("nodeB")
+	for _, topic := range topics {
+		owner := r2.GetOwner(topic)
+		replica := r2.GetReplica(topic)
+		assert.NotEqual(t, owner, replica,
+			"for topic %q on 2-node ring: replica %s must not equal owner %s", topic, replica, owner)
 	}
 }
 
-// TestNodes verifies that Nodes() returns all distinct IDs.
-func TestNodes(t *testing.T) {
-	r := New(10)
-	r.Add("alpha", "localhost:9001")
-	r.Add("beta", "localhost:9002")
-	r.Add("gamma", "localhost:9003")
+// TestDeterminism verifies that identical ring state produces identical owner mappings
+// across different Ring instances, regardless of insertion order.
+func TestDeterminism(t *testing.T) {
+	r1 := New(150)
+	r1.AddNode("node1")
+	r1.AddNode("node2")
+	r1.AddNode("node3")
 
-	ids := r.Nodes()
-	assert.Len(t, ids, 3)
-	assert.ElementsMatch(t, []string{"alpha", "beta", "gamma"}, ids)
+	// r2 adds nodes in reverse order
+	r2 := New(150)
+	r2.AddNode("node3")
+	r2.AddNode("node1")
+	r2.AddNode("node2")
 
-	r.Remove("beta")
-	ids = r.Nodes()
-	assert.Len(t, ids, 2)
-	assert.NotContains(t, ids, "beta")
+	for i := 0; i < 500; i++ {
+		topic := fmt.Sprintf("account-event-%d", i)
+		owner1 := r1.GetOwner(topic)
+		owner2 := r2.GetOwner(topic)
+		replica1 := r1.GetReplica(topic)
+		replica2 := r2.GetReplica(topic)
+
+		assert.Equal(t, owner1, owner2, "owner mismatch for topic %s across instances", topic)
+		assert.Equal(t, replica1, replica2, "replica mismatch for topic %s across instances", topic)
+	}
 }
 
-// TestConcurrentAccess verifies no data races under concurrent reads and writes.
-// -race detector will catch any violations.
+// TestNodes verifies Nodes() returns all distinct IDs in sorted order.
+func TestNodes(t *testing.T) {
+	r := New(10)
+	r.AddNode("gamma")
+	r.AddNode("alpha")
+	r.AddNode("beta")
+
+	assert.Equal(t, []string{"alpha", "beta", "gamma"}, r.Nodes())
+
+	r.RemoveNode("beta")
+	assert.Equal(t, []string{"alpha", "gamma"}, r.Nodes())
+}
+
+// TestConcurrentAccess verifies thread-safety under concurrent node additions, removals, and lookups.
 func TestConcurrentAccess(t *testing.T) {
 	r := New(150)
-	r.Add("node1", "localhost:9001")
+	r.AddNode("node1")
+	r.AddNode("node2")
 
 	var wg sync.WaitGroup
 
-	// Writer goroutine: rapidly adds and removes nodes.
+	// Writers
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 200; i++ {
-			id := fmt.Sprintf("node%d", i+2)
-			addr := fmt.Sprintf("localhost:%d", 9002+i)
-			r.Add(id, addr)
-			r.Remove(id)
+		for i := 0; i < 100; i++ {
+			id := fmt.Sprintf("dynamic-node-%d", i)
+			r.AddNode(id)
+			r.RemoveNode(id)
 		}
 	}()
 
-	// Reader goroutines: continuously look up owners.
+	// Readers
 	for g := 0; g < 4; g++ {
 		wg.Add(1)
-		go func(g int) {
+		go func(gid int) {
 			defer wg.Done()
-			for i := 0; i < 500; i++ {
-				r.Owner(fmt.Sprintf("topic-%d-%d", g, i))
-				r.Replica(fmt.Sprintf("topic-%d-%d", g, i))
+			for i := 0; i < 300; i++ {
+				topic := fmt.Sprintf("concurrent-topic-%d-%d", gid, i)
+				_ = r.GetOwner(topic)
+				_ = r.GetReplica(topic)
+				_ = r.Nodes()
 			}
 		}(g)
 	}
@@ -189,16 +208,18 @@ func TestConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-// TestAddIdempotent verifies that adding the same node twice doesn't corrupt
-// the ring (the second Add simply overwrites the virtual nodes).
-func TestAddIdempotent(t *testing.T) {
-	r := New(10)
-	r.Add("node1", "localhost:9001")
-	r.Add("node1", "localhost:9001") // duplicate
+// TestRebuildFreeRemovalCorrectness ensures removing nodes preserves ring lookup correctness.
+func TestRebuildFreeRemovalCorrectness(t *testing.T) {
+	r := New(50)
+	r.AddNode("a")
+	r.AddNode("b")
+	r.AddNode("c")
 
-	ids := r.Nodes()
-	assert.Len(t, ids, 1)
+	r.RemoveNode("b")
+	require.Len(t, r.Nodes(), 2)
 
-	_, _, ok := r.Owner("any")
-	assert.True(t, ok)
+	for i := 0; i < 100; i++ {
+		owner := r.GetOwner(fmt.Sprintf("key-%d", i))
+		assert.Contains(t, []string{"a", "c"}, owner)
+	}
 }

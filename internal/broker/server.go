@@ -50,6 +50,11 @@ func NewServer(manager *Manager, cfg *config.Config, logger *slog.Logger) *Serve
 	return s
 }
 
+// RegisterInternalServer registers an implementation of the cluster Internal gRPC service.
+func (s *Server) RegisterInternalServer(srv pb.InternalServer) {
+	pb.RegisterInternalServer(s.grpcServer, srv)
+}
+
 // Publish receives a message payload and publishes it via Manager.
 func (s *Server) Publish(ctx context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
 	if req.GetTopic() == "" {

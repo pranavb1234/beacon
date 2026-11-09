@@ -222,3 +222,100 @@ var Broker_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "pubsub.proto",
 }
+
+const (
+	Internal_Heartbeat_FullMethodName = "/pubsub.v1.Internal/Heartbeat"
+)
+
+// InternalClient is the client API for Internal service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Internal provides cluster-internal RPCs for inter-broker coordination.
+type InternalClient interface {
+	// Heartbeat is sent periodically between cluster peer brokers to monitor liveness.
+	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
+}
+
+type internalClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewInternalClient(cc grpc.ClientConnInterface) InternalClient {
+	return &internalClient{cc}
+}
+
+func (c *internalClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HeartbeatResponse)
+	err := c.cc.Invoke(ctx, Internal_Heartbeat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// InternalServer is the server API for Internal service.
+// All implementations must embed UnimplementedInternalServer
+// for forward compatibility
+//
+// Internal provides cluster-internal RPCs for inter-broker coordination.
+type InternalServer interface {
+	// Heartbeat is sent periodically between cluster peer brokers to monitor liveness.
+	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
+	mustEmbedUnimplementedInternalServer()
+}
+
+// UnimplementedInternalServer must be embedded to have forward compatible implementations.
+type UnimplementedInternalServer struct {
+}
+
+func (UnimplementedInternalServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Heartbeat not implemented")
+}
+func (UnimplementedInternalServer) mustEmbedUnimplementedInternalServer() {}
+
+// UnsafeInternalServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to InternalServer will
+// result in compilation errors.
+type UnsafeInternalServer interface {
+	mustEmbedUnimplementedInternalServer()
+}
+
+func RegisterInternalServer(s grpc.ServiceRegistrar, srv InternalServer) {
+	s.RegisterService(&Internal_ServiceDesc, srv)
+}
+
+func _Internal_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HeartbeatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).Heartbeat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_Heartbeat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).Heartbeat(ctx, req.(*HeartbeatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// Internal_ServiceDesc is the grpc.ServiceDesc for Internal service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var Internal_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "pubsub.v1.Internal",
+	HandlerType: (*InternalServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Heartbeat",
+			Handler:    _Internal_Heartbeat_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "pubsub.proto",
+}
